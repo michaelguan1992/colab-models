@@ -30,7 +30,7 @@ models:
     model_path: Inkling-2-Mini-Uncensored-AD-Q4_K.gguf
     est_vram_gb: 18
     est_download_gb: 17.2
-    extra: ["--context", "32k", "--drafting", "auto"]  # spike: mmproj flag for vision
+    extra: ["--context", "32k", "--drafting", "auto"]  # no MTP head in this GGUF; DSpark drafter needs llama.cpp
 
   qwen:
     kind: llm

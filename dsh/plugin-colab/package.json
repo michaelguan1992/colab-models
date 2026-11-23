@@ -4,6 +4,16 @@
   "private": true,
   "type": "module",
   "main": "index.ts",
-  "keywords": ["dsh-plugin"],
-  "dsh": { "bundle": { "patch": "./cordis.yml" } }
+  "keywords": [
+    "dsh-plugin"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
+    "@deepseek-ai/schemastery": "3.19.0"
+  }
 }

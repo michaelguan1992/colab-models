@@ -203,6 +203,11 @@ def cmd_watchdog(cfg: Config, a) -> int:
             if not Colab(cfg).session_active():
                 print(f"{datetime.now():%F %T} 会话已不存在，watchdog 退出", flush=True)
                 break
+            if now - unreachable_since >= limit:
+                # Session is billing but the controller never answered (failed deploy, dead tunnel).
+                print(f"{datetime.now():%F %T} 连续 {limit / 60:.0f} 分钟连不上 controller，自动 lm down", flush=True)
+                cmd_down(cfg, argparse.Namespace(keep_session=False))
+                break
             if now - unreachable_since > 120:
                 try:
                     tunnel.start(cfg, Colab(cfg).proxy_command())
@@ -339,12 +344,20 @@ def cmd_logs(cfg: Config, a) -> int:
 
 def cmd_setup_dsh(cfg: Config, a) -> int:
     """Add a `colab` provider to the dsh profile patch (merging into the existing llm-pi-ai row)."""
+    efforts = {"off": "none", "low": "low", "medium": "medium", "high": "high"}
     patch = Path(cfg.dsh_home).expanduser() / "profiles" / (a.profile or cfg.dsh_profile) / "cordis.patch.yml"
     provider = {
         "api": "openai-completions",
         "baseURL": f"{cfg.base_url}/v1",
-        "compat": {"supportsDeveloperRole": False, "maxTokensField": "max_tokens"},
-        "models": [{"id": "inkling"}, {"id": "qwen"}],
+        # dsh refuses keyless custom routes ("No API key for provider"); the controller ignores it.
+        "apiKeyEnv": "LM_COLAB_API_KEY",
+        # Strata takes OpenAI-style reasoning_effort: none|low|medium|high (docs/DETAILS.md).
+        "compat": {"supportsDeveloperRole": False, "maxTokensField": "max_tokens",
+                   "supportsReasoningEffort": True},
+        # Strata runs Inkling-2-Mini without a thinking mode (inkling_dialect.py: "off / none only"),
+        # so dsh shows no effort selector for it. Qwen keeps the levels (unverified until Qwen runs).
+        "models": [{"id": "inkling", "reasoningEfforts": False},
+                   {"id": "qwen", "reasoningEfforts": dict(efforts)}],
     }
     rows = yaml.safe_load(patch.read_text()) if patch.exists() else None
     rows = rows or []
@@ -377,7 +390,9 @@ def cmd_dsh(cfg: Config, a) -> int:
     plugin_patch = REPO_ROOT / "dsh" / "plugin-colab" / "cordis.yml"
     cmd = ["npx", "-y", "@deepseek-ai/dsh", "web", "--patch", str(plugin_patch)]
     print("启动 dsh：" + " ".join(cmd))
-    return subprocess.call(cmd)
+    env = {**os.environ}
+    env.setdefault("LM_COLAB_API_KEY", "local")  # any non-empty value; see cmd_setup_dsh
+    return subprocess.call(cmd, env=env)
 
 
 def main(argv: list[str] | None = None) -> int:

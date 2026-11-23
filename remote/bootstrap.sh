@@ -6,7 +6,7 @@ mkdir -p /content/lm/logs /content/models /content/outputs
 
 if [ ! -f /content/lm/.deps_ok ]; then
   python3 -m pip install -q "fastapi>=0.115" "uvicorn>=0.30" "httpx>=0.27" pyyaml psutil \
-    "huggingface_hub[hf_transfer]>=0.30"
+    "huggingface_hub>=1.0"
   touch /content/lm/.deps_ok
 fi
 

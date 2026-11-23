@@ -75,7 +75,7 @@ class Backend:
         cmd = ["hf", "download", repo, "--local-dir", str(local_dir)]
         for pat in include or []:
             cmd += ["--include", pat]
-        env = {**os.environ, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
+        env = {**os.environ, "HF_XET_HIGH_PERFORMANCE": "1"}  # hf_transfer is gone in huggingface_hub 1.x
         await self._run_logged(cmd, env=env)
 
     async def download(self) -> None:

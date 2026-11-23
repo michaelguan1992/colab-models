@@ -13,10 +13,16 @@ colab ssh -s localmodels -- bash -lc 'nvidia-smi; df -h /content; free -g'
 - [x] 2026-11-22 T4 探测：立即分到（us-east1），随即 `colab stop` → 账号没有被限制，G4 的 503 是容量问题（同 google-colab-cli#236）。G4 应低频重试（10–15 分钟一次、每天有上限）
 - [ ] 2026-11-22 回退测试：`--gpu A100 --high-mem`（80GB）和 `--gpu A100`（40GB）各试 1 次，都是 503 → 当时高端 GPU 普遍没容量，备选链不能只靠 A100
 - [ ] 2026-11-22 23:35 再试 G4、A100 80GB 各 1 次：仍是 503
+- [ ] 2026-11-23 02:10、06:11（PST）用 `lm up --no-load` 自动申请两轮（每轮 G4、A100 80GB 各 1 次）：仍全部 503。`lm` 正确把失败识别为「容量」并退出，没有留下会话
 - [x] `colab status -s NAME` 在会话不存在时也返回 0 → `lm` 的 `session_active()` 改为解析 `colab sessions` 输出
+- [x] 2026-11-23 08:2x 每小时轮询（G4 → A100 80GB → L4）第一轮：G4、A100 仍 503，**L4 分到**（NVIDIA L4 22.5GB）。整个 L4 测试约 10 分钟，花费 0.11 计算单元
+- [x] L4 实测：驱动 580.82.07、CUDA 13.0、compute 8.9；`/content` 236GB（overlay，只用了 419MB）；内存 52GB；12 核。G4 的同类数据仍待测
 - [ ] Ultra 账号能分到 G4（RTX PRO 6000 96GB）；驱动 ≥ 580（Strata 的 CUDA 13 包需要）
 - [ ] `/content` 剩余空间：____ GB（社区数据约 236GB；三个模型合计约 242GB 放不下，controller 会在下载前删除离线模型的权重）
 - [ ] 内存：____ GB
+
+- [x] 调度规则 3 在 L4 上生效：加载 Pika 被拒（「pika 预计 69GB + 在线的 inkling ≈ 87GB，超过本机可用 18GB」），没有开始下载
+- [x] huggingface_hub 1.x 已不用 hf_transfer → 改用 `HF_XET_HIGH_PERFORMANCE=1`
 
 ### 1b. 回退到 A100 80GB 时（`lm up` 分不到 G4 会自动尝试）
 - [ ] `nvidia-smi` 显示 80GB，驱动版本 ____。驱动 < 580 时 Strata 的 CUDA 13 包跑不了；v0.2.20 也发布了 `strata-engine-…-cuda12` 包，需要确认安装脚本会不会自动选它
@@ -27,19 +33,20 @@ colab ssh -s localmodels -- bash -lc 'nvidia-smi; df -h /content; free -g'
 ```bash
 ssh -N -L 9000:127.0.0.1:9000 -o ProxyCommand="colab ssh -s localmodels --proxy-mode" root@colab-localmodels
 ```
-- [ ] 能连上。若用户名不是 root、或需要密钥（`colab ssh -i KEY`），写进 config.toml：`ssh_user`、`ssh_extra = ["-i", "~/.ssh/colab"]`
-- [ ] `colab ssh -- CMD` 退出后，`setsid nohup` 起的 controller 仍在运行
+- [x] 能连上（L4，root，无需密钥）。若用户名不是 root、或需要密钥（`colab ssh -i KEY`），写进 config.toml：`ssh_user`、`ssh_extra = ["-i", "~/.ssh/colab"]`
+- [x] `colab ssh -- CMD` 退出后，`setsid nohup` 起的 controller 仍在运行
+- [x] **Colab 每个运行时只允许一条 SSH 连接**：隧道连着时，再 `colab ssh` 返回 HTTP 429。→ 隧道改为 OpenSSH ControlMaster（`~/.local/state/lm/cm.sock`），`lm logs` 等远程命令走同一条连接；没有隧道时才用 `colab ssh`
 
 ## 3. Strata
 ```bash
 lm up --no-load && lm load inkling && lm logs inkling
 ```
-- [ ] 安装脚本在 Colab（Linux x86_64、root）能跑通，`strata` 在 PATH 里
-- [ ] `strata launch --model-path … --port 8081 --access local --no-api-key --yes --no-tui` 留在前台运行（如果它会自己转成后台进程，`launch --stop --port` 必须能停掉它）
-- [ ] 提供 `/v1/models` 和 `/v1/chat/completions`；带 tool calling 的请求能正常返回
-- [ ] Inkling：视觉输入用的 mmproj 参数名 → 加到 `models.inkling.extra`
+- [x] 安装脚本能跑通（v0.2.20：校验和、签名都通过），装到 `/root/.local/bin/strata`；登录 shell 的 PATH 里没有它，bootstrap 已自行加上
+- [x] `strata launch` **会转成后台进程**（runtime → serve.server → strata-inkling 引擎，父进程变成 init），launch 本身随即退出。`launch --stop --port 8081` 能停掉它，卸载后显存回到 0。→ 显存统计改为按端口找监听进程，再统计其整个进程树；实测 Inkling 17.5GB
+- [x] `/v1/models`、`/v1/chat/completions` 正常；tool calling 返回标准 `tool_calls`；流式首 token 0.85s，约 30 chunk/s（L4）。冷启动（下载 17GB + 启动）2 分 15 秒，从磁盘重新加载 48 秒
+- [ ] Inkling 视觉：Strata 会自动找到同目录的 mmproj（`--vision …mmproj…`，配置里显示 `vision: cpu`），不用另加参数。但发图片返回 400：「this Inkling-2-Mini engine does not read images yet; update Strata or attach the Vision shard」→ 要么等 Strata 新版，要么查 Vision shard 是什么
 - [ ] Qwen：能直接读分片目录 `IQ3_XXS/`；n-gram 表（shard 2）是 mmap 而不是整个加载进显存；实测显存 ____ GB
-- [ ] `--drafting auto` 对两个模型分别选中了什么（mtp / dflash2）
+- [ ] `--drafting auto`：Inkling 没有启用投机解码（引擎参数里没有 draft/mtp）。Qwen 待测
 
 ## 4. Pika
 ```bash

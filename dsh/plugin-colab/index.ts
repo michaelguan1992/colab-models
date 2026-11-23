@@ -175,7 +175,7 @@ export function apply(ctx: Context, config: Config) {
       'Requires the pika model to be online. Returns the local path of the saved MP4.',
     parameters: {
       prompt: { type: 'string', required: true, description: 'Scene description, including sound.' },
-      seconds: { type: 'number', required: false, description: 'Duration in seconds (default 5).' },
+      seconds: { type: 'number', description: 'Duration in seconds (default 5).' },
     },
     output: { schema: { type: 'string' }, render: (_a: unknown, v: string) => [{ type: 'text', text: v }] },
     async execute(args: { prompt: string; seconds?: number }, exec: { signal: AbortSignal }) {

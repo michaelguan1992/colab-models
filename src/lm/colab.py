@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from . import tunnel
 from .config import Config
 
 
@@ -93,6 +94,12 @@ class Colab:
 
     # ---- remote execution ------------------------------------------------
     def ssh(self, command: str, capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+        r = tunnel.run(self.cfg, command, capture=capture)  # reuse the tunnel's connection if up
+        if r is not None:
+            if check and r.returncode != 0:
+                detail = (r.stderr or r.stdout or "").strip() if capture else ""
+                raise ColabError(f"远端命令失败 (code {r.returncode}) {detail}")
+            return r
         return self._run("ssh", "-s", self.cfg.session, "--", "bash", "-lc", command,
                          capture=capture, check=check)
 

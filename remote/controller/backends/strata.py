@@ -5,7 +5,33 @@ import os
 
 import httpx
 
+from ..gpu import process_tree
 from .base import Backend
+
+
+def _runtime_root(pid: int) -> int:
+    """Walk up from the port listener to the topmost strata process (the daemonised runtime)."""
+    try:
+        import psutil
+        proc = psutil.Process(pid)
+        for parent in proc.parents():
+            if "strata" not in " ".join(parent.cmdline()):
+                break
+            proc = parent
+        return proc.pid
+    except Exception:
+        return pid
+
+
+def listener_pid(port: int) -> int | None:
+    try:
+        import psutil
+        for c in psutil.net_connections(kind="tcp"):
+            if c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == port and c.pid:
+                return c.pid
+    except Exception:
+        pass
+    return None
 
 
 class StrataBackend(Backend):
@@ -38,6 +64,16 @@ class StrataBackend(Backend):
         if data:
             self.upstream_model = data[0].get("id")
         return True
+
+    def pids(self) -> set[int]:
+        # `strata launch` daemonises (runtime -> serve.server -> engine, re-parented to init) and
+        # exits, so our own child pid says nothing about VRAM. Find the server by its port.
+        if self.state in ("stopped", "stopping", "error", "pending", "downloading"):
+            return set()
+        lp = listener_pid(self.port)
+        if lp is None:
+            return super().pids()
+        return process_tree(_runtime_root(lp))
 
     async def _kill(self) -> None:
         # Strata may daemonise its server; ask it to stop on our port first.

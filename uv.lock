@@ -270,7 +270,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'remote'", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'remote'", specifier = ">=0.27" },
-    { name = "huggingface-hub", extras = ["hf-transfer"], marker = "extra == 'remote'", specifier = ">=0.30" },
+    { name = "huggingface-hub", marker = "extra == 'remote'", specifier = ">=1.0" },
     { name = "psutil", marker = "extra == 'remote'", specifier = ">=5.9" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "pyyaml", marker = "extra == 'remote'", specifier = ">=6" },
