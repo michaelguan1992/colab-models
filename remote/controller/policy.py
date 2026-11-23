@@ -4,6 +4,8 @@ Rules (user-defined):
   1. At most one LLM online at any time.
   2. The video model (Pika) may only be online while the online LLM uses
      less than ``VIDEO_LLM_LIMIT_GB`` of VRAM (or no LLM is online).
+  3. Everything that stays online plus the target must fit in the GPU that was
+     actually assigned (G4 96GB, or a fallback such as A100 80GB), minus a margin.
 
 Pure functions only, so they can be unit-tested without a GPU.
 """
@@ -36,15 +38,39 @@ class Decision:
     reason: str = ""
 
 
-def _llm_vram(o: Online, specs: dict[str, Spec]) -> float:
+def _vram(o: Online, specs: dict[str, Spec]) -> float:
     """Measured VRAM if known, otherwise the registry estimate."""
     if o.vram_gb is not None:
         return o.vram_gb
     return specs[o.id].est_vram_gb if o.id in specs else float("inf")
 
 
-def plan_load(target: Spec, online: list[Online], specs: dict[str, Spec], swap: bool = True) -> Decision:
-    """Decide whether ``target`` may be loaded, and what must be unloaded first."""
+def plan_load(target: Spec, online: list[Online], specs: dict[str, Spec], swap: bool = True,
+              total_gb: float | None = None, margin_gb: float = 0.0) -> Decision:
+    """Decide whether ``target`` may be loaded, and what must be unloaded first.
+
+    ``total_gb`` is the assigned GPU's VRAM; ``None`` (unknown) skips rule 3.
+    """
+    d = _plan_rules(target, online, specs, swap)
+    if not d.ok or total_gb is None or any(o.id == target.id for o in online):
+        return d
+    staying = [o for o in online if o.id not in d.unload]
+    need = sum(_vram(o, specs) for o in staying) + target.est_vram_gb
+    budget = total_gb - margin_gb
+    if need > budget:
+        names = "、".join(o.id for o in staying)
+        return Decision(
+            False,
+            reason=(
+                f"显存不够：{target.id} 预计 {target.est_vram_gb:.0f}GB"
+                + (f" + 在线的 {names}" if staying else "")
+                + f" ≈ {need:.0f}GB，超过本机可用 {budget:.0f}GB（{total_gb:.0f}GB − 余量 {margin_gb:.0f}GB）"
+            ),
+        )
+    return d
+
+
+def _plan_rules(target: Spec, online: list[Online], specs: dict[str, Spec], swap: bool) -> Decision:
     if any(o.id == target.id for o in online):
         return Decision(True, reason=f"{target.id} 已在线")
 
@@ -69,7 +95,7 @@ def plan_load(target: Spec, online: list[Online], specs: dict[str, Spec], swap: 
 
     if target.kind == "video":
         for o in llms:
-            used = _llm_vram(o, specs)
+            used = _vram(o, specs)
             if used >= VIDEO_LLM_LIMIT_GB:
                 return Decision(
                     False,

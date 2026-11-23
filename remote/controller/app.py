@@ -77,7 +77,7 @@ def create_app(manager: Manager, idle_poll_s: float = 30, autoload: str | None =
     # ---- OpenAI / Anthropic compatible proxy -----------------------------
     @app.get("/v1/models")
     async def models():
-        manager.touch()
+        # No touch(): dsh polls the model list, which must not keep a billed runtime "busy".
         llm = manager.active_llm()
         data = []
         if llm:

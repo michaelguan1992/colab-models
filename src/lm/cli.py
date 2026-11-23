@@ -5,11 +5,14 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
+import random
 import shutil
+import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import httpx
@@ -17,7 +20,12 @@ import yaml
 
 from . import tunnel
 from .colab import Colab, ColabError, eprint
-from .config import CONFIG_PATH, REPO_ROOT, Config, load
+from .config import CONFIG_PATH, REPO_ROOT, STATE_DIR, Config, load
+
+ASSIGN_STATE = STATE_DIR / "assign.json"
+SESSION_STATE = STATE_DIR / "session.json"
+WATCHDOG_PID = STATE_DIR / "watchdog.pid"
+WATCHDOG_LOG = STATE_DIR / "watchdog.log"
 
 STATE_ICON = {"ready": "● 在线", "offline": "○ 离线", "downloading": "◐ 下载中", "starting": "◑ 启动中",
               "stopping": "◌ 停止中", "error": "✕ 错误", "pending": "◌ 排队"}
@@ -38,7 +46,7 @@ def ensure_tunnel(cfg: Config) -> None:
 
 def print_status(s: dict, cfg: Config) -> None:
     g = s["gpu"]
-    print(f"Session  {cfg.session} ({cfg.gpu})   API {cfg.base_url}/v1")
+    print(f"Session  {cfg.session}   API {cfg.base_url}/v1")
     if g.get("available"):
         print(f"GPU      {g['name']}  {g['used_gb']:.1f} / {g['total_gb']:.1f} GB")
     print(f"{'模型':<10}{'状态':<14}{'显存':>8}   说明")
@@ -75,15 +83,149 @@ def wait_model(cfg: Config, model_id: str, timeout: float = 3600) -> bool:
     return False
 
 
+# ---- GPU assignment ------------------------------------------------------
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _attempts_today() -> int:
+    st = _read_json(ASSIGN_STATE)
+    return int(st.get("count", 0)) if st.get("date") == date.today().isoformat() else 0
+
+
+def _count_attempt() -> None:
+    ASSIGN_STATE.write_text(json.dumps({"date": date.today().isoformat(), "count": _attempts_today() + 1}))
+
+
+def _label(acc: dict) -> str:
+    return acc["gpu"] + (" high-mem" if acc.get("high_mem") else "")
+
+
+def acquire(cfg: Config, colab: Colab, wait: bool) -> bool:
+    """Get a runtime from cfg.accelerators, in order. One request per accelerator per round.
+
+    Capacity errors (503) move on to the next accelerator; with --wait, a new round starts
+    after ~assign_retry_minutes. A daily request cap keeps us far from the rapid-retry
+    pattern that got other accounts restricted (colabtools#6206).
+    """
+    accs = list(cfg.accelerators)
+    rnd = 0
+    while True:
+        rnd += 1
+        for acc in list(accs):
+            if _attempts_today() >= cfg.assign_daily_limit:
+                print(f"今天已发出 {cfg.assign_daily_limit} 次分配请求，达到上限（assign_daily_limit），明天再试。")
+                return False
+            print(f"申请 {_label(acc)} …", flush=True)
+            _count_attempt()
+            ok, kind, detail = colab.new(acc["gpu"], bool(acc.get("high_mem")))
+            if not ok:
+                msg = {"capacity": "暂时没有空闲容量（503）",
+                       "rejected": "被拒绝（400，该规格不可用），以后不再尝试",
+                       "quota": "已有太多会话（412），先 `colab sessions` 清理",
+                       }.get(kind, f"失败：{detail}")
+                print(f"  {_label(acc)} {msg}")
+                if kind == "rejected":
+                    accs.remove(acc)
+                if kind == "quota":
+                    return False
+                continue
+            if detail:
+                print(f"  {detail}")
+            name, vram = colab.gpu_info()
+            if vram and vram < cfg.min_vram_gb:
+                print(f"  分到的是 {name} {vram:.0f}GB，小于 min_vram_gb={cfg.min_vram_gb:.0f}，停掉换下一个")
+                colab.stop()
+                continue
+            print(f"  已分配 {name}（{vram:.0f}GB）")
+            SESSION_STATE.write_text(json.dumps({"gpu": acc["gpu"], "name": name, "vram_gb": vram,
+                                                 "since": time.time()}))
+            return True
+        if not accs:
+            print("所有备选 GPU 都被拒绝，请检查 accelerators 配置")
+            return False
+        if not wait:
+            print("这一轮都没分到。稍后再运行 `lm up`，或用 `lm up --wait` 自动按间隔重试。")
+            return False
+        delay = cfg.assign_retry_minutes * 60 * random.uniform(0.8, 1.2)
+        print(f"第 {rnd} 轮没分到，{delay / 60:.0f} 分钟后重试（Ctrl-C 放弃）…", flush=True)
+        time.sleep(delay)
+
+
+# ---- idle watchdog -------------------------------------------------------
+def _watchdog_pid() -> int | None:
+    try:
+        pid = int(WATCHDOG_PID.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return None
+
+
+def start_watchdog(cfg: Config) -> None:
+    if cfg.idle_stop_minutes <= 0 or _watchdog_pid():
+        return
+    log = open(WATCHDOG_LOG, "ab")
+    p = subprocess.Popen([sys.executable, "-m", "lm.cli", "watchdog"], stdin=subprocess.DEVNULL,
+                         stdout=log, stderr=log, start_new_session=True)
+    WATCHDOG_PID.write_text(str(p.pid))
+
+
+def stop_watchdog() -> None:
+    pid = _watchdog_pid()
+    WATCHDOG_PID.unlink(missing_ok=True)
+    if pid and pid != os.getpid():
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def cmd_watchdog(cfg: Config, a) -> int:
+    """Runs detached on the Mac: `lm down` once the runtime has been idle for idle_stop_minutes.
+
+    The controller only unloads models when idle; the Colab session itself keeps billing
+    (~9 CU/h on G4) until stopped. Note: this does not run while the Mac sleeps.
+    """
+    limit = cfg.idle_stop_minutes * 60
+    unreachable_since: float | None = None
+    while True:
+        time.sleep(60)
+        try:
+            s = httpx.get(f"{cfg.base_url}/admin/status", timeout=10).json()
+            unreachable_since = None
+        except (httpx.HTTPError, ValueError):
+            now = time.time()
+            unreachable_since = unreachable_since or now
+            if not Colab(cfg).session_active():
+                print(f"{datetime.now():%F %T} 会话已不存在，watchdog 退出", flush=True)
+                break
+            if now - unreachable_since > 120:
+                try:
+                    tunnel.start(cfg, Colab(cfg).proxy_command())
+                except RuntimeError as e:
+                    print(f"{datetime.now():%F %T} 重连隧道失败：{e}", flush=True)
+            continue
+        if s.get("idle_seconds", 0) >= limit:
+            print(f"{datetime.now():%F %T} 空闲 {s['idle_seconds'] / 60:.0f} 分钟，自动 lm down", flush=True)
+            cmd_down(cfg, argparse.Namespace(keep_session=False))
+            break
+    WATCHDOG_PID.unlink(missing_ok=True)
+    return 0
+
+
 # ---- commands ------------------------------------------------------------
 def cmd_up(cfg: Config, a) -> int:
     colab = Colab(cfg)
     model = None if a.no_load else (a.model or cfg.default_model)
     if colab.session_active():
         print(f"复用已有 Colab 会话 {cfg.session}")
-    else:
-        print(f"创建 Colab 会话 {cfg.session}（{cfg.gpu}{', high-mem' if cfg.high_mem else ''}）…")
-        colab.new()
+    elif not acquire(cfg, colab, wait=a.wait):
+        return 1
+    start_watchdog(cfg)
     print("部署 controller …")
     colab.deploy(load=model)
     print("建立 ssh 隧道 …")
@@ -99,6 +241,7 @@ def cmd_up(cfg: Config, a) -> int:
 
 
 def cmd_down(cfg: Config, a) -> int:
+    stop_watchdog()
     if tunnel.healthy(cfg):
         print("卸载所有模型 …")
         api(cfg, "POST", "/admin/unload", json={}, timeout=120)
@@ -110,6 +253,7 @@ def cmd_down(cfg: Config, a) -> int:
     colab = Colab(cfg)
     if colab.session_active():
         colab.stop()
+        SESSION_STATE.unlink(missing_ok=True)
         print(f"已停止 Colab 会话 {cfg.session}，不再消耗计算单元")
     else:
         print("没有活动的 Colab 会话")
@@ -244,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("model", nargs="?", help="要加载的模型（默认取配置 default_model）")
     s.add_argument("--no-load", action="store_true", help="只开机，不加载模型")
     s.add_argument("--open", action="store_true", help="完成后启动 dsh")
+    s.add_argument("--wait", action="store_true", help="分不到 GPU 时按 assign_retry_minutes 间隔继续重试")
     s.set_defaults(fn=cmd_up)
 
     s = sub.add_parser("down", help="卸载模型、关隧道、停止 Colab 会话")
@@ -290,6 +435,9 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("dsh", help="带 colab 插件启动 dsh web")
     s.set_defaults(fn=cmd_dsh)
+
+    s = sub.add_parser("watchdog", help=argparse.SUPPRESS)  # spawned by `lm up`
+    s.set_defaults(fn=cmd_watchdog)
 
     a = p.parse_args(argv)
     cfg = load()

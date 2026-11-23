@@ -10,10 +10,17 @@ if [ ! -f /content/lm/.deps_ok ]; then
   touch /content/lm/.deps_ok
 fi
 
+# Pinned: Strata ships several releases a day. Bump STRATA_VERSION deliberately.
+STRATA_VERSION="${STRATA_VERSION:-v0.2.20}"
 if ! command -v strata >/dev/null 2>&1; then
-  curl -fsSL --connect-timeout 15 --max-time 120 \
-    https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o /tmp/strata-install.sh
-  sh /tmp/strata-install.sh
+  feed="https://github.com/Niko1221/Strata/releases/download/$STRATA_VERSION"
+  curl -fsSL --connect-timeout 15 --max-time 120 "$feed/install.sh" -o /tmp/strata-install.sh
+  curl -fsSL --connect-timeout 15 --max-time 60 "$feed/SHA256SUMS.txt" -o /tmp/strata-SHA256SUMS.txt
+  want=$(awk '$2=="install.sh"{print $1}' /tmp/strata-SHA256SUMS.txt)
+  got=$(sha256sum /tmp/strata-install.sh | cut -d' ' -f1)
+  [ -n "$want" ] && [ "$want" = "$got" ] || { echo "strata install.sh checksum mismatch" >&2; exit 1; }
+  # The installer verifies the signed packages it downloads from the same feed.
+  STRATA_FEED="$feed" sh /tmp/strata-install.sh
   # installer may put the binary in ~/.local/bin
   export PATH="$HOME/.local/bin:$PATH"
 fi

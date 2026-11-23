@@ -15,7 +15,9 @@ strata:
   stop: ["launch", "--stop", "--port", "{port}"]
   port: 8081
 
-idle_unload_minutes: 45
+idle_unload_minutes: 45   # controller unloads models; the Mac watchdog stops the session (idle_stop_minutes)
+vram_margin_gb: 4         # rule 3: online models + target must fit in (GPU total - margin)
+disk_reserve_gb: 10       # keep free on /content; offline models' weights are deleted to make room
 
 models:
   inkling:

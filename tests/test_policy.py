@@ -72,3 +72,23 @@ def test_violations():
     assert violations([Online("inkling", "llm", 17), Online("pika", "video", 68)], SPECS) == []
     assert violations([Online("inkling", "llm", 22), Online("pika", "video", 68)], SPECS)
     assert violations([Online("inkling", "llm", 17), Online("qwen", "llm", 40)], SPECS)
+
+
+def test_total_vram_g4_allows_inkling_plus_pika():
+    d = plan_load(SPECS["pika"], [Online("inkling", "llm", 17.8)], SPECS, total_gb=96, margin_gb=4)
+    assert d.ok
+
+
+def test_total_vram_a100_rejects_inkling_plus_pika():
+    d = plan_load(SPECS["pika"], [Online("inkling", "llm", 17.8)], SPECS, total_gb=80, margin_gb=4)
+    assert not d.ok and "显存不够" in d.reason
+
+
+def test_total_vram_a100_allows_pika_alone_and_counts_swapped_out_llm_as_free():
+    assert plan_load(SPECS["pika"], [], SPECS, total_gb=80, margin_gb=4).ok
+    d = plan_load(SPECS["qwen"], [Online("inkling", "llm", 17.8)], SPECS, total_gb=80, margin_gb=4)
+    assert d.ok and d.unload == ["inkling"]
+
+
+def test_total_vram_rejects_model_bigger_than_gpu():
+    assert not plan_load(SPECS["qwen"], [], SPECS, total_gb=40, margin_gb=4).ok

@@ -4,12 +4,24 @@
 
 ## 1. Colab 会话
 ```bash
-colab new -s localmodels --gpu G4 --high-mem
+colab new -s localmodels --gpu G4
 colab ssh -s localmodels -- bash -lc 'nvidia-smi; df -h /content; free -g'
 ```
+- [x] colab CLI 0.8.0 授权成功，余额 1061.29 计算单元（2026-11-22）
+- [x] `--gpu G4 --high-mem` 被拒（HTTP 400）。原因是 G4 没有 high-mem 规格，标准规格已有约 185GB 内存；CLI 提示的「无权限」只是它对所有 400 的固定说法。配置里 G4 不带 high_mem
+- [ ] 不带 `--high-mem` 的 G4：首次尝试返回 HTTP 503 Service Unavailable（CLI 已自动重试 3 次，每次间隔 10s），可能是暂时没有空闲容量。2026-11-22 再试约 3.5 小时后仍是 503；没有分配到会话，也没有扣计算单元。注意：`COLAB_CLI_RETRY_BACKOFF` 是指数退避的基数（第 n 次等 `backoff × 2^n` 秒），不要设太大
+- [x] 2026-11-22 T4 探测：立即分到（us-east1），随即 `colab stop` → 账号没有被限制，G4 的 503 是容量问题（同 google-colab-cli#236）。G4 应低频重试（10–15 分钟一次、每天有上限）
+- [ ] 2026-11-22 回退测试：`--gpu A100 --high-mem`（80GB）和 `--gpu A100`（40GB）各试 1 次，都是 503 → 当时高端 GPU 普遍没容量，备选链不能只靠 A100
+- [ ] 2026-11-22 23:35 再试 G4、A100 80GB 各 1 次：仍是 503
+- [x] `colab status -s NAME` 在会话不存在时也返回 0 → `lm` 的 `session_active()` 改为解析 `colab sessions` 输出
 - [ ] Ultra 账号能分到 G4（RTX PRO 6000 96GB）；驱动 ≥ 580（Strata 的 CUDA 13 包需要）
-- [ ] `/content` 剩余空间：____ GB（Qwen 约 77GB + Inkling 约 17GB + Pika 子集约 150GB？）
+- [ ] `/content` 剩余空间：____ GB（社区数据约 236GB；三个模型合计约 242GB 放不下，controller 会在下载前删除离线模型的权重）
 - [ ] 内存：____ GB
+
+### 1b. 回退到 A100 80GB 时（`lm up` 分不到 G4 会自动尝试）
+- [ ] `nvidia-smi` 显示 80GB，驱动版本 ____。驱动 < 580 时 Strata 的 CUDA 13 包跑不了；v0.2.20 也发布了 `strata-engine-…-cuda12` 包，需要确认安装脚本会不会自动选它
+- [ ] Strata 在 sm_80 上能跑 Inkling 和 Qwen
+- [ ] Pika 单独在线：实测显存 ____ GB（必须 ≤ 76，即 80 − 4 余量）
 
 ## 2. 隧道
 ```bash

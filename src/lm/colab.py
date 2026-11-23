@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -15,6 +17,18 @@ from .config import Config
 
 class ColabError(RuntimeError):
     pass
+
+
+def classify_assign_error(output: str) -> str:
+    """Map `colab new` failure output to capacity | rejected | quota | error."""
+    o = output.lower()
+    if "service unavailable" in o or re.search(r"\b50[234]\b", o) or "timed out" in o or "readtimeout" in o:
+        return "capacity"
+    if "toomanyassignments" in o or re.search(r"\b412\b", o):
+        return "quota"
+    if "bad request" in o or re.search(r"\b400\b", o) or "not eligible" in o or "entitle" in o:
+        return "rejected"
+    return "error"
 
 
 class Colab:
@@ -33,14 +47,42 @@ class Colab:
 
     # ---- sessions --------------------------------------------------------
     def session_active(self) -> bool:
-        r = self._run("status", "-s", self.cfg.session, capture=True, check=False)
-        return r.returncode == 0
+        # `colab status` exits 0 even when the session is missing, so parse `colab sessions`.
+        r = self._run("sessions", capture=True, check=False)
+        return any(line.strip().startswith(f"[{self.cfg.session}]")
+                   for line in (r.stdout or "").splitlines())
 
-    def new(self) -> None:
-        args = ["new", "-s", self.cfg.session, "--gpu", self.cfg.gpu]
-        if self.cfg.high_mem:
+    def new(self, gpu: str, high_mem: bool = False) -> tuple[bool, str, str]:
+        """One assignment request, no CLI-side retries (lm owns retry policy).
+
+        Returns (ok, kind, detail); kind is "" on success, else classify_assign_error().
+        """
+        args = [self.cfg.colab_bin, "new", "-s", self.cfg.session, "--gpu", gpu]
+        if high_mem:
             args.append("--high-mem")
-        self._run(*args)
+        env = {**os.environ, "COLAB_CLI_ASSIGN_RETRIES": "0"}
+        r = subprocess.run(args, text=True, capture_output=True, env=env)
+        out = (r.stdout or "") + (r.stderr or "")
+        if r.returncode == 0 and "error" not in out.lower():
+            return True, "", ""
+        # A timed-out POST can still leave a (billed) runtime behind: adopt it if it exists.
+        if self.session_active():
+            return True, "", "请求报错，但会话已存在，直接使用"
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip() and "│" not in ln and "╭" not in ln and "╰" not in ln]
+        return False, classify_assign_error(out), (lines[-1] if lines else f"exit {r.returncode}")
+
+    def gpu_info(self) -> tuple[str, float]:
+        """(name, total VRAM in GB) of the assigned runtime."""
+        r = self.ssh("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits",
+                     capture=True, check=False)
+        for line in (r.stdout or "").splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) == 2:
+                try:
+                    return parts[0], float(parts[1]) / 1024
+                except ValueError:
+                    pass
+        return "unknown", 0.0
 
     def stop(self) -> None:
         self._run("stop", "-s", self.cfg.session)

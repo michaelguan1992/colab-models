@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 from . import gpu as gpu_mod
@@ -12,6 +14,18 @@ from .policy import Decision, Online, plan_load, violations
 from .registry import Registry
 
 BackendFactory = Callable[[str, dict, Registry], Backend]
+GiB = 1024**3
+
+
+def dir_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file() and not f.is_symlink())
+
+
+def disk_free(path: Path) -> int:
+    path.mkdir(parents=True, exist_ok=True)
+    return shutil.disk_usage(path).free
 
 
 def default_factory(model_id: str, cfg: dict, registry: Registry) -> Backend:
@@ -23,10 +37,12 @@ def default_factory(model_id: str, cfg: dict, registry: Registry) -> Backend:
 
 class Manager:
     def __init__(self, registry: Registry, factory: BackendFactory = default_factory,
-                 probe: Callable[[], gpu_mod.GpuSnapshot] = gpu_mod.probe) -> None:
+                 probe: Callable[[], gpu_mod.GpuSnapshot] = gpu_mod.probe,
+                 free_bytes: Callable[[Path], int] = disk_free) -> None:
         self.registry = registry
         self.factory = factory
         self.probe = probe
+        self.free_bytes = free_bytes
         self.backends: dict[str, Backend] = {}
         self.tasks: dict[str, asyncio.Task] = {}
         self.lock = asyncio.Lock()
@@ -67,7 +83,10 @@ class Manager:
         cfg = self.registry.model(model_id)
         async with self.lock:
             spec = self.registry.specs[model_id]
-            decision = plan_load(spec, self.online(), self.registry.specs, swap=swap)
+            snap = self.probe()
+            decision = plan_load(spec, self.online(snap), self.registry.specs, swap=swap,
+                                 total_gb=snap.total_gb if snap.available else None,
+                                 margin_gb=self.registry.vram_margin_gb)
             if not decision.ok:
                 self._log(f"拒绝加载 {model_id}: {decision.reason}")
                 return decision
@@ -76,10 +95,52 @@ class Manager:
             for other in decision.unload:
                 await self._unload_locked(other)
             backend = self.factory(model_id, cfg, self.registry)
+            if not cfg.get("skip_download"):
+                ok, why = self._ensure_disk(backend)
+                if not ok:
+                    self._log(f"拒绝加载 {model_id}: {why}")
+                    return Decision(False, unload=decision.unload, reason=why)
             self.backends[model_id] = backend
             self.tasks[model_id] = asyncio.create_task(self._start(backend))
             self._log(f"开始加载 {model_id}" + (f"（已卸载 {', '.join(decision.unload)}）" if decision.unload else ""))
             return decision
+
+    # ---- disk ------------------------------------------------------------
+    def _weight_dirs(self, model_id: str) -> list[Path]:
+        base = self.registry.models_dir
+        return [base / model_id, base / f"{model_id}-lora"]
+
+    def _ensure_disk(self, backend: Backend) -> tuple[bool, str]:
+        """Make room for ``backend``'s download by deleting weights of offline models.
+
+        Weights are re-downloaded from HF on the next load anyway, so evicting is cheap
+        compared with failing a 150GB download halfway (G4 disk is ~236GB).
+        """
+        est = float(backend.cfg.get("est_download_gb") or 0) * GiB
+        have = sum(dir_size(d) for d in self._weight_dirs(backend.id))
+        need = max(0.0, est - have) + self.registry.disk_reserve_gb * GiB
+        free = self.free_bytes(self.registry.models_dir)
+        if free >= need:
+            return True, ""
+        live = {b.id for b in self._live()} | {backend.id}
+        candidates = [(sum(dir_size(d) for d in self._weight_dirs(m)), m)
+                      for m in self.registry.models if m not in live]
+        evicted = []
+        for size, mid in sorted(candidates, reverse=True):
+            if free >= need:
+                break
+            if size == 0:
+                continue
+            for d in self._weight_dirs(mid):
+                shutil.rmtree(d, ignore_errors=True)
+            evicted.append(mid)
+            free = self.free_bytes(self.registry.models_dir)
+        if evicted:
+            self._log(f"磁盘不够，已删除离线模型的权重：{', '.join(evicted)}")
+        if free >= need:
+            return True, ""
+        return False, (f"磁盘不够：{backend.id} 还需约 {need / GiB:.0f}GB（含 {self.registry.disk_reserve_gb:.0f}GB 余量），"
+                       f"只剩 {free / GiB:.0f}GB；请先卸载其他模型")
 
     async def _start(self, backend: Backend) -> None:
         await backend.start()

@@ -37,10 +37,11 @@ class FakeBackend(Backend):
         return self.vram[self.id]
 
 
-def make_client():
-    reg = Registry.load(REGISTRY_YAML)
+def make_client(total_gb=96, free_bytes=lambda p: 10**15, registry=None):
+    reg = registry or Registry.load(REGISTRY_YAML)
     mgr = Manager(reg, factory=FakeBackend,
-                  probe=lambda: GpuSnapshot("RTX PRO 6000", 0, 96, {}, True))
+                  probe=lambda: GpuSnapshot("RTX PRO 6000", 0, total_gb, {}, True),
+                  free_bytes=free_bytes)
     return TestClient(create_app(mgr, idle_poll_s=3600)), mgr
 
 
@@ -112,7 +113,7 @@ def test_video_requires_pika():
 
 def test_idle_unload():
     reg = Registry.load(REGISTRY_YAML)
-    mgr = Manager(reg, factory=FakeBackend, probe=lambda: GpuSnapshot())
+    mgr = Manager(reg, factory=FakeBackend, probe=lambda: GpuSnapshot(), free_bytes=lambda p: 10**15)
 
     async def run():
         await mgr.load("inkling")
@@ -128,3 +129,51 @@ def test_files_rejects_traversal():
     client, _ = make_client()
     with client:
         assert client.get("/files/..%2Fetc%2Fpasswd").status_code in (400, 404)
+
+
+def test_a100_80_rejects_pika_next_to_inkling():
+    client, _ = make_client(total_gb=80)
+    with client:
+        client.post("/admin/load", json={"id": "inkling"})
+        wait_ready(client, "inkling")
+        r = client.post("/admin/load", json={"id": "pika"})
+        assert r.status_code == 409 and "显存不够" in r.json()["reason"]
+
+
+def _tmp_registry(tmp_path):
+    import yaml
+    raw = yaml.safe_load(REGISTRY_YAML.read_text())
+    raw["paths"] = {"models_dir": str(tmp_path / "models"), "outputs_dir": str(tmp_path / "out"),
+                    "logs_dir": str(tmp_path / "logs")}
+    raw["disk_reserve_gb"] = 0
+    return Registry(raw)
+
+
+def test_disk_evicts_offline_weights_then_loads(tmp_path):
+    reg = _tmp_registry(tmp_path)
+    qwen = reg.models_dir / "qwen"
+    qwen.mkdir(parents=True)
+    (qwen / "w.gguf").write_bytes(b"x" * 1000)
+    # Pretend the disk only has room once qwen's weights are gone.
+    free = lambda p: 10**15 if not qwen.exists() else 0
+    client, _ = make_client(free_bytes=free, registry=reg)
+    with client:
+        r = client.post("/admin/load", json={"id": "inkling"})
+        assert r.status_code == 200, r.json()
+        assert not qwen.exists()
+
+
+def test_disk_rejects_when_eviction_is_not_enough(tmp_path):
+    reg = _tmp_registry(tmp_path)
+    client, _ = make_client(free_bytes=lambda p: 0, registry=reg)
+    with client:
+        r = client.post("/admin/load", json={"id": "pika"})
+        assert r.status_code == 409 and "磁盘不够" in r.json()["reason"]
+
+
+def test_model_list_polling_does_not_reset_idle():
+    client, mgr = make_client()
+    with client:
+        mgr.last_activity -= 1000
+        client.get("/v1/models")
+        assert client.get("/admin/status").json()["idle_seconds"] >= 999

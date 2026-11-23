@@ -33,6 +33,29 @@ lm up            # 开机 + 部署 + 隧道 + 加载 inkling（lm up qwen 则加
 ```bash
 lm down          # 卸载模型 + 关闭隧道 + 停止 Colab 会话（停止计费）
 ```
+### 分不到 GPU 时
+G4 经常返回 503（没有空闲容量，不是账号问题）。`lm up` 按 `accelerators` 顺序每种只申请一次：先 G4，再 A100 80GB（high-mem）。都没有就退出。
+- `lm up --wait`：每隔约 `assign_retry_minutes`（默认 12 分钟，±20% 随机）再申请一轮。
+- 每天最多发 `assign_daily_limit`（默认 12）次申请，多次运行 `lm up` 共用这个额度。短时间内大量重试曾导致别的账号被限制（colabtools#6206）。
+- 分到的显存小于 `min_vram_gb`（默认 75）就立刻停掉，换下一种。
+- 在 A100 80GB 上，Inkling 和 Pika 不能同时在线（规则 3：在线模型加目标模型的显存，不能超过 GPU 总显存减余量）。
+
+### 计费与自动关机
+- controller 空闲 `idle_unload_minutes`（45）分钟后只卸载模型，Colab 会话仍按小时计费（G4 约 8.9 计算单元/小时）。
+- `lm up` 会在 Mac 上起一个 watchdog，空闲 `idle_stop_minutes`（默认 60）分钟后自动 `lm down`。日志在 `~/.local/state/lm/watchdog.log`。
+- Mac 睡眠时 watchdog 不运行，所以离开前最好手动 `lm down`。
+- dsh 轮询模型列表不算活动，不会让会话一直开着。
+
+### 配置（`~/.config/lm/config.toml`，都是可选项）
+```toml
+accelerators = [{gpu = "G4"}, {gpu = "A100", high_mem = true}]
+min_vram_gb = 75
+assign_retry_minutes = 12
+assign_daily_limit = 12
+idle_stop_minutes = 60
+default_model = "inkling"
+```
+
 其他命令：`lm status [--usage]`、`lm load <id>`、`lm unload [id]`、`lm video "提示词" [--image 首帧.png]`、`lm tunnel`、`lm logs [controller|inkling|qwen|pika]`、`lm dsh`。
 
 ### 在 dsh 里使用

@@ -48,5 +48,13 @@ class Registry:
         return self.raw.get("strata", {})
 
     @property
+    def vram_margin_gb(self) -> float:
+        return float(self.raw.get("vram_margin_gb", 4))
+
+    @property
+    def disk_reserve_gb(self) -> float:
+        return float(self.raw.get("disk_reserve_gb", 10))
+
+    @property
     def idle_unload_minutes(self) -> float:
         return float(self.raw.get("idle_unload_minutes", 45))
