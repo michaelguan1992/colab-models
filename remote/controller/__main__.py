@@ -6,7 +6,7 @@ import uvicorn
 
 from .app import create_app
 from .manager import Manager
-from .registry import Registry
+from .registry import Registry, RegistryError
 
 
 def main() -> None:
@@ -17,7 +17,11 @@ def main() -> None:
     p.add_argument("--load", default=None, help="model id to load at startup")
     args = p.parse_args()
 
-    manager = Manager(Registry.load(args.config))
+    try:
+        registry = Registry.load(args.config)
+    except RegistryError as e:
+        raise SystemExit(f"{args.config} 有误: {e}")
+    manager = Manager(registry)
     app = create_app(manager, autoload=args.load)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

@@ -260,6 +260,7 @@ remote = [
 [package.dev-dependencies]
 dev = [
     { name = "fastapi" },
+    { name = "huggingface-hub" },
     { name = "psutil" },
     { name = "pytest" },
     { name = "uvicorn" },
@@ -281,6 +282,7 @@ provides-extras = ["remote"]
 [package.metadata.requires-dev]
 dev = [
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "huggingface-hub", specifier = ">=1.0" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "pytest", specifier = ">=8" },
     { name = "uvicorn", specifier = ">=0.30" },

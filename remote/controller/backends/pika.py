@@ -14,10 +14,6 @@ class PikaBackend(Backend):
     kind = "video"
 
     @property
-    def port(self) -> int:
-        return int(self.cfg.get("port", 8090))
-
-    @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
@@ -26,9 +22,10 @@ class PikaBackend(Backend):
         return self.registry.models_dir / f"{self.id}-lora"
 
     async def download(self) -> None:
-        await self._hf_download(self.cfg["repo"], self.cfg.get("include"), self.local_dir)
+        await self._hf_download(self.cfg["repo"], self.cfg.get("include"), self.local_dir,
+                                self.cfg.get("revision"))
         lora = self.cfg["lora"]
-        await self._hf_download(lora["repo"], [lora["file"]], self.lora_dir)
+        await self._hf_download(lora["repo"], [lora["file"]], self.lora_dir, lora.get("revision"))
         marker = self.registry.models_dir / ".pika_deps_ok"
         req = self.local_dir / "examples" / "requirements-diffusers.txt"
         if req.exists() and not marker.exists():
@@ -57,6 +54,7 @@ class PikaBackend(Backend):
         if r.status_code != 200:
             return False
         body = r.json()
+        self.queue_depth = int(body.get("queue_depth") or 0)
         if body.get("error"):
             raise RuntimeError(body["error"])
         return bool(body.get("ready"))

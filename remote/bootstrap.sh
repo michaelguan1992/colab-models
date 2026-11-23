@@ -12,6 +12,7 @@ fi
 
 # Pinned: Strata ships several releases a day. Bump STRATA_VERSION deliberately.
 STRATA_VERSION="${STRATA_VERSION:-v0.2.20}"
+export PATH="$HOME/.local/bin:$PATH"
 if ! command -v strata >/dev/null 2>&1; then
   feed="https://github.com/Niko1221/Strata/releases/download/$STRATA_VERSION"
   curl -fsSL --connect-timeout 15 --max-time 120 "$feed/install.sh" -o /tmp/strata-install.sh
@@ -28,10 +29,12 @@ fi
 # (Re)start the controller detached from this ssh session.
 pkill -f "python3 -m controller" 2>/dev/null || true
 export PATH="$HOME/.local/bin:$PATH"
-setsid nohup python3 -m controller --config models.yaml --port 9000 ${LOAD:+--load "$LOAD"} \
+# Reported by /health so the Mac can tell whether the running controller matches this checkout.
+export LM_VERSION="${LM_VERSION:-$(find . -type f \( -name '*.py' -o -name '*.yaml' -o -name '*.sh' \) -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)}"
+setsid nohup python3 -m controller --config models.yaml --port "${LM_PORT:-9000}" ${LOAD:+--load "$LOAD"} \
   > /content/lm/logs/controller.log 2>&1 < /dev/null &
 for i in $(seq 1 30); do
-  curl -sf http://127.0.0.1:9000/health >/dev/null && { echo "controller up"; exit 0; }
+  curl -sf http://127.0.0.1:${LM_PORT:-9000}/health >/dev/null && { echo "controller up"; exit 0; }
   sleep 1
 done
 echo "controller failed to start:" >&2

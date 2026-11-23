@@ -87,3 +87,15 @@ colab ssh -s localmodels -- bash -lc 'python3 -m venv /content/fv && /content/fv
 - [ ] 端到端耗时 ____ s，对比 BF16 + Turbo 4 步的 ____ s
 - [ ] 画质和音频与 BF16 + Turbo 并排对比（固定种子、3–5 个提示词）
 - [ ] 结论：值得切换的话，在 `pika_worker.py` 里新增 FastVideo 后端，并把 models.yaml 换成 NVFP4 仓库（步数固定为 6，不再挂 Turbo LoRA）
+
+## 7. 第 1 阶段真机验证（2026-11-23，A100-SXM4-80GB，compute_cap 8.0）
+
+- 旧 controller 的 `/health` 只返回 `{"ok": true}`；新 `lm` 把它识别为旧版并重新部署，没有误报端口冲突。
+- 部署后 `/health` 返回 `{"service": "lm-controller", "version": "19c7209e16fd"}`，与本地 `code_version` 一致。
+- 三个模型都选中唯一路线（strata / pika），`compute_cap` 正确读到 8.0。
+- Inkling 加载期间 `busy: true`；上线后实测显存 18.4GB；对话正常。
+- 版本一致时 `lm up` 跳过部署，在线模型不受影响。
+- 强制重新部署（模拟 controller 重启）后：GPU 上没有残留进程，8081 不再监听，`/content/lm/state.json` 清空。旧代码在这里会留下约 18GB 的孤儿 Strata。
+- 之后再次加载 Inkling 正常，端口和显存都已释放。
+- 修了一个旧 bug：`bootstrap.sh` 在把 `~/.local/bin` 加进 PATH 之前检查 `strata`，导致每次部署都重新下载安装 Strata（90MB）。
+- 没在真机上验证：磁盘不够时的切换、HF 受限仓库（只对真实 HF API 跑过预检）、空闲卸载等待进行中的请求、HF token 经 `colab ssh` 首次传输。

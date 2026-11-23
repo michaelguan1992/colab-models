@@ -4,5 +4,4 @@
     - id: colab-models
       name: ./index.ts
       config:
-        baseURL: http://127.0.0.1:9000
         lmBin: lm

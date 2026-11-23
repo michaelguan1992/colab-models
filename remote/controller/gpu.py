@@ -14,6 +14,7 @@ class GpuSnapshot:
     total_gb: float = 0.0
     per_pid_gb: dict[int, float] = field(default_factory=dict)
     available: bool = False
+    compute_cap: str = ""  # e.g. "12.0"; empty when unknown
 
 
 def _smi(args: list[str]) -> list[list[str]]:
@@ -36,8 +37,12 @@ def probe() -> GpuSnapshot:
             per_pid[int(row[0])] = float(row[1]) / 1024
         except (ValueError, IndexError):
             continue
+    try:
+        compute_cap = _smi(["--query-gpu=compute_cap"])[0][0]
+    except (subprocess.SubprocessError, IndexError, OSError):
+        compute_cap = ""  # older drivers lack the field; routes with `requires` then cannot match
     return GpuSnapshot(name=gpu[0], used_gb=float(gpu[1]) / 1024, total_gb=float(gpu[2]) / 1024,
-                       per_pid_gb=per_pid, available=True)
+                       per_pid_gb=per_pid, available=True, compute_cap=compute_cap)
 
 
 def process_tree(pid: int) -> set[int]:

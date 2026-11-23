@@ -6,6 +6,7 @@ paths:
   models_dir: /content/models
   outputs_dir: /content/outputs
   logs_dir: /content/lm/logs
+  state_file: /content/lm/state.json   # engines this controller started; reaped on the next controller start
 
 strata:
   bin: strata
@@ -13,63 +14,70 @@ strata:
   launch: ["launch", "--model-path", "{model_path}", "--port", "{port}",
            "--access", "local", "--no-api-key", "--yes", "--no-tui"]
   stop: ["launch", "--stop", "--port", "{port}"]
-  port: 8081
 
 idle_unload_minutes: 45   # controller unloads models; the Mac watchdog stops the session (idle_stop_minutes)
 vram_margin_gb: 4         # rule 3: online models + target must fit in (GPU total - margin)
 disk_reserve_gb: 10       # keep free on /content; offline models' weights are deleted to make room
 
+# Each model lists `routes` in priority order; the first whose `requires` matches the GPU is used
+# (`/admin/load` can name one). Ports are unique per model; omit `port` to get one assigned (from 8081).
 models:
   inkling:
     kind: llm
     display: Inkling-2-Mini Uncensored (Q4_K)
-    repo: AtomicChat/Inkling-2-Mini-Uncensored-GGUF
-    include:
-      - Inkling-2-Mini-Uncensored-AD-Q4_K.gguf
-      - mmproj-Inkling-2-Mini-Uncensored-BF16.gguf
-    model_path: Inkling-2-Mini-Uncensored-AD-Q4_K.gguf
-    est_vram_gb: 18
-    est_download_gb: 17.2
-    extra: ["--context", "32k", "--drafting", "auto"]  # no MTP head in this GGUF; DSpark drafter needs llama.cpp
+    routes:
+      - engine: strata
+        repo: AtomicChat/Inkling-2-Mini-Uncensored-GGUF
+        include:
+          - Inkling-2-Mini-Uncensored-AD-Q4_K.gguf
+          - mmproj-Inkling-2-Mini-Uncensored-BF16.gguf
+        model_path: Inkling-2-Mini-Uncensored-AD-Q4_K.gguf
+        vram_gb: 18
+        est_download_gb: 17.2
+        extra: ["--context", "32k", "--drafting", "auto"]  # no MTP head in this GGUF; DSpark drafter needs llama.cpp
 
   qwen:
     kind: llm
     display: Qwen3.8-Flash-Next abliterated (IQ3_XXS)
-    repo: SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF
-    include:
-      - IQ3_XXS/*
-      - mtp-q2_0.gguf          # Strata-only draft head
-    model_path: IQ3_XXS        # folder of shards; shard 2 (n-gram table) should stay mmapped
-    est_vram_gb: 50
-    est_download_gb: 77
-    extra: ["--context", "32k", "--drafting", "auto"]  # spike: dflash2 vs mtp
+    routes:
+      - engine: strata
+        repo: SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF
+        include:
+          - IQ3_XXS/*
+          - mtp-q2_0.gguf          # Strata-only draft head
+        model_path: IQ3_XXS        # folder of shards; shard 2 (n-gram table) should stay mmapped
+        vram_gb: 50
+        est_download_gb: 77
+        extra: ["--context", "32k", "--drafting", "auto"]  # spike: dflash2 vs mtp
 
   pika:
     kind: video
     display: Pika-H3-Flex + Turbo LoRA (4-step)
-    repo: Pika-Labs/Pika-H3-Flex
-    # FL2VA/T2V only. Sizes (HF API, 2026-11): transformer 66.3GB, text_encoder 66.7GB
-    # (Qwen3-VL-32B BF16), vae 10.4GB, audio_vae 0.6GB. Skipped: transformer_ref/ 66.3GB,
-    # ref2va/ + fl2va/ adapters 2.8GB each (Turbo LoRA already fuses the Flex adapter), comfy/.
-    include:
-      - modular_model_index.json
-      - transformer/*
-      - vae/*
-      - audio_vae/*
-      - text_encoder/*
-      - tokenizer/*
-      - processor/*
-      - scheduler/*
-      - audio_scheduler/*
-      - examples/requirements-diffusers.txt   # pinned diffusers commit
-    lora:
-      repo: Pika-Labs/Pika-H3-Flex-Turbo-LoRA
-      file: pika_h3_flex_turbo_4step_fl2va.safetensors
-    workflow: fl2va
-    steps: 4
-    guidance: 1.0
-    port: 8090
-    est_vram_gb: 69
-    est_download_gb: 148       # 144GB base subset + 3.9GB Turbo LoRA
-    # Alternative under evaluation: FastVideo/Pika-H3-Flex-NVFP4-QAD (~68GB, FastVideo engine,
-    # fixed 6 steps, no Turbo). See docs/spike.md §6 before switching.
+    routes:
+      - engine: pika
+        repo: Pika-Labs/Pika-H3-Flex
+        # FL2VA/T2V only. Sizes (HF API, 2026-11): transformer 66.3GB, text_encoder 66.7GB
+        # (Qwen3-VL-32B BF16), vae 10.4GB, audio_vae 0.6GB. Skipped: transformer_ref/ 66.3GB,
+        # ref2va/ + fl2va/ adapters 2.8GB each (Turbo LoRA already fuses the Flex adapter), comfy/.
+        include:
+          - modular_model_index.json
+          - transformer/*
+          - vae/*
+          - audio_vae/*
+          - text_encoder/*
+          - tokenizer/*
+          - processor/*
+          - scheduler/*
+          - audio_scheduler/*
+          - examples/requirements-diffusers.txt   # pinned diffusers commit
+        lora:
+          repo: Pika-Labs/Pika-H3-Flex-Turbo-LoRA
+          file: pika_h3_flex_turbo_4step_fl2va.safetensors
+        workflow: fl2va
+        steps: 4
+        guidance: 1.0
+        port: 8090
+        vram_gb: 69
+        est_download_gb: 148       # 144GB base subset + 3.9GB Turbo LoRA
+        # Alternative under evaluation: FastVideo/Pika-H3-Flex-NVFP4-QAD (~68GB, FastVideo engine,
+        # fixed 6 steps, no Turbo). See docs/spike.md §6 before switching.

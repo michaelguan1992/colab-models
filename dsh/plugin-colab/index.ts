@@ -27,7 +27,7 @@ export interface Config {
 }
 
 export const Config: Schema<Config> = Schema.object({
-  baseURL: Schema.string().default('http://127.0.0.1:9000'),
+  baseURL: Schema.string().default(process.env.LM_BASE_URL ?? 'http://127.0.0.1:9000'),
   lmBin: Schema.string().default('lm'),
   outputsDir: Schema.string().default('outputs'),
 })
@@ -193,6 +193,7 @@ export function apply(ctx: Context, config: Config) {
       }
       if (job.state !== 'done' || !job.file) throw new Error(`生成失败：${job.error}`)
       const file = await fetch(`${config.baseURL}/files/${job.file}`, { signal: exec.signal })
+      if (!file.ok) throw new Error(`下载视频失败：HTTP ${file.status}`)
       await mkdir(config.outputsDir, { recursive: true })
       const dest = join(config.outputsDir, job.file)
       await writeFile(dest, Buffer.from(await file.arrayBuffer()))

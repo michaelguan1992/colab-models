@@ -6,12 +6,15 @@ import argparse
 import base64
 import json
 import os
+import posixpath
 import random
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
@@ -21,6 +24,7 @@ import yaml
 from . import tunnel
 from .colab import Colab, ColabError, eprint
 from .config import CONFIG_PATH, REPO_ROOT, STATE_DIR, Config, load
+from .lock import state_lock
 
 ASSIGN_STATE = STATE_DIR / "assign.json"
 SESSION_STATE = STATE_DIR / "session.json"
@@ -31,17 +35,29 @@ STATE_ICON = {"ready": "● 在线", "offline": "○ 离线", "downloading": "�
               "stopping": "◌ 停止中", "error": "✕ 错误", "pending": "◌ 排队"}
 
 
+WATCHDOG_POLL_S = 60
+WATCHDOG_WAKE_GAP_S = 3 * WATCHDOG_POLL_S
+LOCKED_COMMANDS = {"up", "down", "load", "unload", "tunnel", "video", "setup-dsh"}
+
+
 # ---- helpers -------------------------------------------------------------
+class ControllerUnreachable(RuntimeError):
+    pass
+
+
 def api(cfg: Config, method: str, path: str, **kw) -> httpx.Response:
     try:
         return httpx.request(method, f"{cfg.base_url}{path}", timeout=kw.pop("timeout", 30), **kw)
     except httpx.HTTPError as e:
-        raise SystemExit(f"连不上 controller ({cfg.base_url})：{e}\n运行 `lm up` 或 `lm tunnel`。")
+        raise ControllerUnreachable(f"连不上 controller ({cfg.base_url})：{e}\n运行 `lm up` 或 `lm tunnel`。")
 
 
-def ensure_tunnel(cfg: Config) -> None:
-    if not tunnel.healthy(cfg):
-        tunnel.start(cfg, Colab(cfg).proxy_command())
+def ensure_tunnel(cfg: Config, colab: Colab | None = None, require_health: bool = True) -> None:
+    """Reuse a working tunnel; only (re)start it when it is not. require_health=False accepts a live ssh
+    master even if the controller is not answering yet."""
+    if tunnel.healthy(cfg) or (not require_health and tunnel.master_alive(cfg)):
+        return
+    tunnel.start(cfg, (colab or Colab(cfg)).proxy_command(), require_health=require_health)
 
 
 def print_status(s: dict, cfg: Config) -> None:
@@ -184,39 +200,85 @@ def stop_watchdog() -> None:
             pass
 
 
+@dataclass
+class WatchState:
+    last_tick: float | None = None
+    unreachable_since: float | None = None
+    grace_until: float = 0.0
+    query_failing: bool = False
+
+
+def _log(msg: str) -> None:
+    print(f"{datetime.now():%F %T} {msg}", flush=True)
+
+
+def _guarded_down(cfg: Config, colab: Colab) -> bool:
+    """Stop the runtime unless another lm command holds the lock. True once the runtime is stopped."""
+    with state_lock(wait=False) as got:
+        if not got:
+            _log("另一个 lm 命令正在运行，这一轮跳过停止")
+            return False
+        try:
+            return shutdown(cfg, colab, keep_session=False) == 0
+        except (ColabError, RuntimeError) as e:
+            _log(f"自动停止失败，继续守护：{e}")
+            return False
+
+
+def watchdog_tick(cfg: Config, colab: Colab, st: WatchState, now: float, status: dict | None) -> bool:
+    """One guard step. status is /admin/status or None when unreachable. True when the watchdog is done."""
+    limit = cfg.idle_stop_minutes * 60
+    if st.last_tick is not None and now - st.last_tick > WATCHDOG_WAKE_GAP_S:
+        _log("检测到电脑刚睡醒，空闲时间从现在重新计算")
+        st.grace_until = now + limit
+        st.unreachable_since = None
+    st.last_tick = now
+    if status is None:
+        st.unreachable_since = st.unreachable_since or now
+        active = colab.session_active()
+        if active is False:
+            _log("会话已不存在，watchdog 退出")
+            return True
+        if active is None and not st.query_failing:
+            _log("colab CLI 查询失败（授权过期或断网？），无法确认会话状态，继续守护")
+        st.query_failing = active is None
+        if now >= st.grace_until and now - st.unreachable_since >= limit:
+            _log(f"连续 {limit / 60:.0f} 分钟连不上 controller，自动停止")
+            return _guarded_down(cfg, colab)
+        if now - st.unreachable_since > 120:
+            with state_lock(wait=False) as got:
+                if got:
+                    try:
+                        tunnel.start(cfg, colab.proxy_command())
+                    except RuntimeError as e:
+                        _log(f"重连隧道失败：{e}")
+        return False
+    st.unreachable_since = None
+    st.query_failing = False
+    if status.get("busy"):
+        return False
+    if now >= st.grace_until and status.get("idle_seconds", 0) >= limit:
+        _log(f"空闲 {status['idle_seconds'] / 60:.0f} 分钟，自动停止")
+        return _guarded_down(cfg, colab)
+    return False
+
+
 def cmd_watchdog(cfg: Config, a) -> int:
-    """Runs detached on the Mac: `lm down` once the runtime has been idle for idle_stop_minutes.
+    """Runs detached on the Mac: stops the runtime once it has been idle for idle_stop_minutes.
 
     The controller only unloads models when idle; the Colab session itself keeps billing
-    (~9 CU/h on G4) until stopped. Note: this does not run while the Mac sleeps.
+    (~9 CU/h on G4) until stopped. It never stops while the controller reports busy work, and
+    after the Mac wakes from sleep it waits a full idle window before stopping.
     """
-    limit = cfg.idle_stop_minutes * 60
-    unreachable_since: float | None = None
+    colab = Colab(cfg)
+    st = WatchState()
     while True:
-        time.sleep(60)
+        time.sleep(WATCHDOG_POLL_S)
         try:
-            s = httpx.get(f"{cfg.base_url}/admin/status", timeout=10).json()
-            unreachable_since = None
+            status = httpx.get(f"{cfg.base_url}/admin/status", timeout=10).json()
         except (httpx.HTTPError, ValueError):
-            now = time.time()
-            unreachable_since = unreachable_since or now
-            if not Colab(cfg).session_active():
-                print(f"{datetime.now():%F %T} 会话已不存在，watchdog 退出", flush=True)
-                break
-            if now - unreachable_since >= limit:
-                # Session is billing but the controller never answered (failed deploy, dead tunnel).
-                print(f"{datetime.now():%F %T} 连续 {limit / 60:.0f} 分钟连不上 controller，自动 lm down", flush=True)
-                cmd_down(cfg, argparse.Namespace(keep_session=False))
-                break
-            if now - unreachable_since > 120:
-                try:
-                    tunnel.start(cfg, Colab(cfg).proxy_command())
-                except RuntimeError as e:
-                    print(f"{datetime.now():%F %T} 重连隧道失败：{e}", flush=True)
-            continue
-        if s.get("idle_seconds", 0) >= limit:
-            print(f"{datetime.now():%F %T} 空闲 {s['idle_seconds'] / 60:.0f} 分钟，自动 lm down", flush=True)
-            cmd_down(cfg, argparse.Namespace(keep_session=False))
+            status = None
+        if watchdog_tick(cfg, colab, st, time.time(), status):
             break
     WATCHDOG_PID.unlink(missing_ok=True)
     return 0
@@ -226,49 +288,81 @@ def cmd_watchdog(cfg: Config, a) -> int:
 def cmd_up(cfg: Config, a) -> int:
     colab = Colab(cfg)
     model = None if a.no_load else (a.model or cfg.default_model)
-    if colab.session_active():
+    active = colab.session_active()
+    if active is None:
+        print("无法查询 Colab 会话（colab CLI 出错，授权过期或断网？）。先运行 `colab sessions` 检查。")
+        return 1
+    if active:
         print(f"复用已有 Colab 会话 {cfg.session}")
     elif not acquire(cfg, colab, wait=a.wait):
         return 1
     start_watchdog(cfg)
-    print("部署 controller …")
-    colab.deploy(load=model)
-    print("建立 ssh 隧道 …")
-    tunnel.start(cfg, colab.proxy_command())
-    print(f"就绪：{cfg.base_url}/v1")
-    if model:
-        print(f"加载 {model}（首次需从 HF 下载）…")
-        if not wait_model(cfg, model):
+    health = tunnel.Probe("down")
+    if active:
+        ensure_tunnel(cfg, colab, require_health=False)
+        health = tunnel.probe(cfg)
+        if health.state == "foreign":
+            raise tunnel.PortConflict(tunnel.conflict_message(cfg))
+    if health.state == "ours" and health.version == colab.version:
+        print(f"controller 代码版本 {health.version} 与本地一致，跳过部署")
+        if model and not request_load(cfg, model, swap=True):
             return 1
-    if a.open:
-        return cmd_dsh(cfg, a)
+    else:
+        print("部署 controller …")
+        colab.deploy(load=model)
+        print("建立 ssh 隧道 …")
+        ensure_tunnel(cfg, colab)
+    print(f"就绪：{cfg.base_url}/v1")
+    if model and not wait_model(cfg, model):
+        return 1
+    return 0
+
+
+def shutdown(cfg: Config, colab: Colab, keep_session: bool) -> int:
+    if tunnel.healthy(cfg):
+        print("卸载所有模型 …")
+        try:
+            api(cfg, "POST", "/admin/unload", json={}, timeout=120)
+        except ControllerUnreachable as e:
+            print(f"卸载失败：{e}\n继续关闭。")
+    if tunnel.stop():
+        print("已关闭隧道")
+    if keep_session:
+        print("保留 Colab 会话（仍在计费）")
+        return 0
+    active = colab.session_active()
+    if active is False:
+        print("没有活动的 Colab 会话")
+        return 0
+    if active is None:
+        print("无法确认会话状态（colab CLI 查询失败），仍尝试停止 …")
+    try:
+        colab.stop()
+    except ColabError as e:
+        if active is None:
+            print(f"停止失败，会话可能仍在计费：{e}")
+            return 1
+        raise
+    SESSION_STATE.unlink(missing_ok=True)
+    print(f"已停止 Colab 会话 {cfg.session}，不再消耗计算单元")
     return 0
 
 
 def cmd_down(cfg: Config, a) -> int:
     stop_watchdog()
-    if tunnel.healthy(cfg):
-        print("卸载所有模型 …")
-        api(cfg, "POST", "/admin/unload", json={}, timeout=120)
-    if tunnel.stop():
-        print("已关闭隧道")
-    if a.keep_session:
-        print("保留 Colab 会话（仍在计费）")
-        return 0
-    colab = Colab(cfg)
-    if colab.session_active():
-        colab.stop()
-        SESSION_STATE.unlink(missing_ok=True)
-        print(f"已停止 Colab 会话 {cfg.session}，不再消耗计算单元")
-    else:
-        print("没有活动的 Colab 会话")
-    return 0
+    return shutdown(cfg, Colab(cfg), a.keep_session)
 
 
 def cmd_status(cfg: Config, a) -> int:
-    if not tunnel.healthy(cfg):
+    probe = tunnel.probe(cfg)
+    if probe.state != "ours":
+        if probe.state == "foreign":
+            print(tunnel.conflict_message(cfg))
+            return 1
         active = Colab(cfg).session_active()
-        print(f"Session  {cfg.session}: {'运行中（隧道未连，运行 lm tunnel）' if active else '未运行'}")
+        label = {True: "运行中（隧道未连，运行 lm tunnel）", False: "未运行",
+                 None: "状态未知（colab CLI 查询失败）"}[active]
+        print(f"Session  {cfg.session}: {label}")
         return 0 if not a.json else 1
     s = api(cfg, "GET", "/admin/status").json()
     if a.json:
@@ -280,15 +374,24 @@ def cmd_status(cfg: Config, a) -> int:
     return 0
 
 
-def cmd_load(cfg: Config, a) -> int:
-    ensure_tunnel(cfg)
-    r = api(cfg, "POST", "/admin/load", json={"id": a.model, "swap": not a.no_swap})
+def request_load(cfg: Config, model: str, swap: bool, route: str | None = None) -> bool:
+    req = {"id": model, "swap": swap}
+    if route:
+        req["route"] = route
+    r = api(cfg, "POST", "/admin/load", json=req)
     body = r.json()
     if r.status_code != 200 or not body.get("ok"):
         print(f"拒绝：{body.get('reason') or body.get('detail')}")
-        return 1
+        return False
     if body.get("unloaded"):
         print(f"已卸载 {', '.join(body['unloaded'])}")
+    return True
+
+
+def cmd_load(cfg: Config, a) -> int:
+    ensure_tunnel(cfg)
+    if not request_load(cfg, a.model, swap=not a.no_swap, route=a.route):
+        return 1
     return 0 if a.no_wait else (0 if wait_model(cfg, a.model) else 1)
 
 
@@ -338,7 +441,8 @@ def cmd_tunnel(cfg: Config, a) -> int:
 
 def cmd_logs(cfg: Config, a) -> int:
     name = a.name or "controller"
-    Colab(cfg).ssh(f"tail -n {a.lines} /content/lm/logs/{name}.log")
+    logs_dir = posixpath.join(posixpath.dirname(cfg.remote_dir.rstrip("/")), "logs")
+    Colab(cfg).ssh(f"tail -n {a.lines} {shlex.quote(f'{logs_dir}/{name}.log')}")
     return 0
 
 
@@ -377,9 +481,11 @@ def cmd_setup_dsh(cfg: Config, a) -> int:
         rows.append(row)
     row.setdefault("config", {}).setdefault("providers", {})["colab"] = provider
     if patch.exists():
-        backup = patch.with_suffix(f".yml.bak-{datetime.now():%Y%m%d%H%M%S}")
+        for old in patch.parent.glob(f"{patch.name}.bak-*"):
+            old.unlink()
+        backup = patch.with_name(f"{patch.name}.bak-{datetime.now():%Y%m%d%H%M%S}")
         shutil.copy2(patch, backup)
-        print(f"已备份 {backup}")
+        print(f"已备份 {backup}（只保留最近一份）")
     patch.parent.mkdir(parents=True, exist_ok=True)
     patch.write_text(yaml.safe_dump(rows, allow_unicode=True, sort_keys=False))
     print(f"已写入 provider colab → {patch}（dsh 下次请求时自动重载）")
@@ -392,6 +498,7 @@ def cmd_dsh(cfg: Config, a) -> int:
     print("启动 dsh：" + " ".join(cmd))
     env = {**os.environ}
     env.setdefault("LM_COLAB_API_KEY", "local")  # any non-empty value; see cmd_setup_dsh
+    env["LM_BASE_URL"] = cfg.base_url  # read by dsh/plugin-colab as its baseURL default
     return subprocess.call(cmd, env=env)
 
 
@@ -419,6 +526,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("model")
     s.add_argument("--no-swap", action="store_true", help="已有 LLM 时拒绝而不是替换")
     s.add_argument("--no-wait", action="store_true")
+    s.add_argument("--route", help="指定引擎路线（如 strata / basalt）")
     s.set_defaults(fn=cmd_load)
 
     s = sub.add_parser("unload", help="卸载模型（不带参数则全部卸载）")
@@ -457,7 +565,14 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     cfg = load()
     try:
-        return a.fn(cfg, a)
+        if a.cmd in LOCKED_COMMANDS:
+            with state_lock():
+                rc = a.fn(cfg, a)
+        else:
+            rc = a.fn(cfg, a)
+        if rc == 0 and getattr(a, "open", False):
+            rc = cmd_dsh(cfg, a)
+        return rc
     except (ColabError, RuntimeError) as e:
         eprint(f"错误：{e}")
         return 1

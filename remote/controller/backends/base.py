@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
-import signal
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
 from ..gpu import process_tree
+from ..procs import kill_group, pid_alive, port_listening
 
 
 class Backend:
@@ -29,6 +30,15 @@ class Backend:
         self.local_dir: Path = registry.models_dir / model_id
         self.log_path: Path = registry.logs_dir / f"{model_id}.log"
         self.upstream_model: str | None = None
+        self.health_failures = 0
+        self.queue_depth = 0  # running + queued jobs, for backends that serve jobs
+        self.recorded_pids: set[int] = set()
+        self.on_launch: Callable[[Backend], None] | None = None
+        self._download_pgids: set[int] = set()
+
+    @property
+    def port(self) -> int:
+        return int(self.cfg["port"])
 
     # ---- lifecycle -------------------------------------------------------
     async def start(self) -> None:
@@ -39,6 +49,8 @@ class Backend:
                 await self.download()
             self.state = "starting"
             await self._launch()
+            if self.on_launch:
+                self.on_launch(self)
             await self._wait_ready(timeout=float(self.cfg.get("ready_timeout_s", 1800)))
             self.state = "ready"
             self.ready_at = time.time()
@@ -51,35 +63,51 @@ class Backend:
             await self._kill()
 
     async def stop(self) -> None:
+        self.recorded_pids |= self.pids()
         self.state = "stopping"
         await self._kill()
         self.state = "stopped"
 
     async def _kill(self) -> None:
+        groups = set(self._download_pgids)
         if self.proc and self.proc.returncode is None:
-            try:
-                os.killpg(self.proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(self.proc.wait(), timeout=30)
-            except asyncio.TimeoutError:
-                try:
-                    os.killpg(self.proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            groups.add(self.proc.pid)
+        await asyncio.gather(*(kill_group(g, grace=30) for g in groups))
+        if self.proc:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.proc.wait(), timeout=5)
+
+    def released(self) -> bool:
+        """The engine's port is closed and none of its recorded processes remain."""
+        return not port_listening(self.port) and not any(pid_alive(p) for p in self.recorded_pids)
+
+    async def wait_released(self, timeout: float, poll: float = 1.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.released():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(poll)
+
+    def busy(self) -> bool:
+        return self.queue_depth > 0
 
     # ---- download --------------------------------------------------------
-    async def _hf_download(self, repo: str, include: list[str] | None, local_dir: Path) -> None:
+    async def _hf_download(self, repo: str, include: list[str] | None, local_dir: Path,
+                           revision: str | None = None) -> None:
         local_dir.mkdir(parents=True, exist_ok=True)
         cmd = ["hf", "download", repo, "--local-dir", str(local_dir)]
+        if revision:
+            cmd += ["--revision", revision]
         for pat in include or []:
             cmd += ["--include", pat]
         env = {**os.environ, "HF_XET_HIGH_PERFORMANCE": "1"}  # hf_transfer is gone in huggingface_hub 1.x
         await self._run_logged(cmd, env=env)
 
     async def download(self) -> None:
-        await self._hf_download(self.cfg["repo"], self.cfg.get("include"), self.local_dir)
+        await self._hf_download(self.cfg["repo"], self.cfg.get("include"), self.local_dir,
+                                self.cfg.get("revision"))
 
     def download_progress(self) -> float | None:
         est = self.cfg.get("est_download_gb")
@@ -92,18 +120,29 @@ class Backend:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.log_path, "ab") as log:
             log.write(f"\n$ {' '.join(cmd)}\n".encode())
-            p = await asyncio.create_subprocess_exec(*cmd, stdout=log, stderr=log, env=env)
-            rc = await p.wait()
+            log.flush()
+            p = await asyncio.create_subprocess_exec(
+                *cmd, stdout=log, stderr=log, env=env, start_new_session=True)
+            self._download_pgids.add(p.pid)
+            try:
+                rc = await p.wait()
+            finally:
+                if p.returncode is None:  # cancelled mid-download: take the whole group down
+                    await asyncio.shield(kill_group(p.pid, grace=10))
+                self._download_pgids.discard(p.pid)
         if rc != 0:
             raise RuntimeError(f"{cmd[0]} 退出码 {rc}，见 {self.log_path}")
 
     async def _spawn(self, cmd: list[str], env: dict | None = None) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         log = open(self.log_path, "ab")
-        log.write(f"\n$ {' '.join(cmd)}\n".encode())
-        log.flush()
-        self.proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=log, stderr=log, env=env, start_new_session=True)
+        try:
+            log.write(f"\n$ {' '.join(cmd)}\n".encode())
+            log.flush()
+            self.proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=log, stderr=log, env=env, start_new_session=True)
+        finally:
+            log.close()
 
     # ---- readiness -------------------------------------------------------
     async def _wait_ready(self, timeout: float) -> None:
@@ -119,6 +158,12 @@ class Backend:
                     pass
                 await asyncio.sleep(3)
         raise TimeoutError(f"{timeout:.0f}s 内未就绪")
+
+    async def check_health(self, client: httpx.AsyncClient) -> bool:
+        try:
+            return await self._ready(client)
+        except (httpx.HTTPError, RuntimeError, ValueError):
+            return False
 
     async def _launch(self) -> None:  # pragma: no cover - abstract
         raise NotImplementedError

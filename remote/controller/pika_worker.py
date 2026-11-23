@@ -112,7 +112,8 @@ def main() -> None:
 
     @app.get("/health")
     def health():
-        return {"ready": w.ready, "error": w.error}
+        depth = sum(1 for j in list(w.jobs.values()) if j["state"] in ("queued", "running"))
+        return {"ready": w.ready, "error": w.error, "queue_depth": depth}
 
     @app.post("/generate")
     def generate(req: GenReq):

@@ -7,14 +7,19 @@ Rules (user-defined):
   3. Everything that stays online plus the target must fit in the GPU that was
      actually assigned (G4 96GB, or a fallback such as A100 80GB), minus a margin.
 
+``plan_load`` decides everything (rules, VRAM, disk, what to unload and what weights to
+delete) before any side effect, so a refused load leaves the runtime untouched.
+
 Pure functions only, so they can be unit-tested without a GPU.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Mapping
 
 VIDEO_LLM_LIMIT_GB = 20.0
+GiB = 1024**3
 
 
 @dataclass(frozen=True)
@@ -45,32 +50,65 @@ def _vram(o: Online, specs: dict[str, Spec]) -> float:
     return specs[o.id].est_vram_gb if o.id in specs else float("inf")
 
 
-def plan_load(target: Spec, online: list[Online], specs: dict[str, Spec], swap: bool = True,
-              total_gb: float | None = None, margin_gb: float = 0.0) -> Decision:
-    """Decide whether ``target`` may be loaded, and what must be unloaded first.
+@dataclass(frozen=True)
+class DiskView:
+    free_bytes: int
+    weights_bytes: Mapping[str, int]  # on-disk weights per registry model id (target's included)
+    need_bytes: int                   # what the target still has to write
+    reserve_bytes: int
+    inflight_bytes: int               # what other in-progress downloads still have to write
 
-    ``total_gb`` is the assigned GPU's VRAM; ``None`` (unknown) skips rule 3.
+
+@dataclass(frozen=True)
+class Plan:
+    ok: bool
+    reason: str = ""
+    unload: list[str] = field(default_factory=list)
+    evict: list[str] = field(default_factory=list)  # models whose on-disk weights get deleted
+
+
+def plan_load(target: Spec, online: list[Online], specs: dict[str, Spec], *, total_gb: float | None,
+              disk: DiskView, margin_gb: float = 0.0, swap: bool = True) -> Plan:
+    """Decide whether ``target`` may be loaded, what to unload first and which weights to delete.
+
+    ``total_gb`` is the assigned GPU's VRAM; ``None`` (unknown) skips the VRAM check. When
+    not ok, ``unload`` and ``evict`` are empty.
     """
-    d = _plan_rules(target, online, specs, swap)
-    if not d.ok or total_gb is None or any(o.id == target.id for o in online):
-        return d
+    d = plan_rules(target, online, specs, swap)
+    if not d.ok or any(o.id == target.id for o in online):
+        return Plan(d.ok, d.reason)
     staying = [o for o in online if o.id not in d.unload]
-    need = sum(_vram(o, specs) for o in staying) + target.est_vram_gb
-    budget = total_gb - margin_gb
-    if need > budget:
-        names = "、".join(o.id for o in staying)
-        return Decision(
-            False,
-            reason=(
+    if total_gb is not None:
+        need = sum(_vram(o, specs) for o in staying) + target.est_vram_gb
+        budget = total_gb - margin_gb
+        if need > budget:
+            names = "、".join(o.id for o in staying)
+            return Plan(False, reason=(
                 f"显存不够：{target.id} 预计 {target.est_vram_gb:.0f}GB"
                 + (f" + 在线的 {names}" if staying else "")
-                + f" ≈ {need:.0f}GB，超过本机可用 {budget:.0f}GB（{total_gb:.0f}GB − 余量 {margin_gb:.0f}GB）"
-            ),
-        )
-    return d
+                + f" ≈ {need:.0f}GB，超过本机可用 {budget:.0f}GB（{total_gb:.0f}GB − 余量 {margin_gb:.0f}GB）"))
+
+    required = disk.need_bytes + disk.reserve_bytes + disk.inflight_bytes
+    free = disk.free_bytes
+    staying_ids = {o.id for o in staying}
+    # Models being unloaded are only evicted if the space is actually needed.
+    candidates = sorted(((size, m) for m, size in disk.weights_bytes.items()
+                         if size > 0 and m != target.id and m not in staying_ids), reverse=True)
+    evict: list[str] = []
+    for size, m in candidates:
+        if free >= required:
+            break
+        evict.append(m)
+        free += size
+    if free < required:
+        extra = f"，另有其他下载还需写入 {disk.inflight_bytes / GiB:.0f}GB" if disk.inflight_bytes else ""
+        return Plan(False, reason=(
+            f"磁盘不够：{target.id} 还需约 {disk.need_bytes / GiB:.0f}GB（含 {disk.reserve_bytes / GiB:.0f}GB 余量{extra}），"
+            f"只剩 {disk.free_bytes / GiB:.0f}GB，删除可删的离线权重后也只有 {free / GiB:.0f}GB；请先卸载其他模型"))
+    return Plan(True, unload=list(d.unload), evict=evict)
 
 
-def _plan_rules(target: Spec, online: list[Online], specs: dict[str, Spec], swap: bool) -> Decision:
+def plan_rules(target: Spec, online: list[Online], specs: dict[str, Spec], swap: bool) -> Decision:
     if any(o.id == target.id for o in online):
         return Decision(True, reason=f"{target.id} 已在线")
 

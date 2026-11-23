@@ -1,57 +1,9 @@
 import asyncio
-import time
-from pathlib import Path
 
-import pytest
-from fastapi.testclient import TestClient
+import yaml
 
-from controller.app import create_app
-from controller.backends.base import Backend
-from controller.gpu import GpuSnapshot
-from controller.manager import Manager
-from controller.registry import Registry
-
-REGISTRY_YAML = Path(__file__).parents[1] / "remote" / "models.yaml"
-
-
-class FakeBackend(Backend):
-    vram = {"inkling": 17.5, "qwen": 48.0, "pika": 68.0}
-
-    def __init__(self, model_id, cfg, registry):
-        super().__init__(model_id, cfg, registry)
-        self.kind = cfg["kind"]
-        self.upstream_model = f"upstream-{model_id}"
-
-    async def start(self):
-        self.state = "ready"
-        self.ready_at = time.time()
-
-    async def stop(self):
-        self.state = "stopped"
-
-    @property
-    def base_url(self):
-        return "http://upstream.invalid"
-
-    def vram_gb(self, per_pid_gb):
-        return self.vram[self.id]
-
-
-def make_client(total_gb=96, free_bytes=lambda p: 10**15, registry=None):
-    reg = registry or Registry.load(REGISTRY_YAML)
-    mgr = Manager(reg, factory=FakeBackend,
-                  probe=lambda: GpuSnapshot("RTX PRO 6000", 0, total_gb, {}, True),
-                  free_bytes=free_bytes)
-    return TestClient(create_app(mgr, idle_poll_s=3600)), mgr
-
-
-def wait_ready(client, model_id):
-    for _ in range(50):
-        s = client.get("/admin/status").json()
-        if model_id in s["online"]:
-            return s
-        time.sleep(0.02)
-    raise AssertionError(f"{model_id} never came online")
+from ctl_helpers import (REGISTRY_YAML, make_client, make_manager,
+                         tmp_registry, wait_ready)
 
 
 def test_models_empty_and_proxy_503():
@@ -112,8 +64,8 @@ def test_video_requires_pika():
 
 
 def test_idle_unload():
-    reg = Registry.load(REGISTRY_YAML)
-    mgr = Manager(reg, factory=FakeBackend, probe=lambda: GpuSnapshot(), free_bytes=lambda p: 10**15)
+    mgr = make_manager()
+    reg = mgr.registry
 
     async def run():
         await mgr.load("inkling")
@@ -140,35 +92,81 @@ def test_a100_80_rejects_pika_next_to_inkling():
         assert r.status_code == 409 and "显存不够" in r.json()["reason"]
 
 
-def _tmp_registry(tmp_path):
-    import yaml
+def _disk_registry(**est_gb):
     raw = yaml.safe_load(REGISTRY_YAML.read_text())
-    raw["paths"] = {"models_dir": str(tmp_path / "models"), "outputs_dir": str(tmp_path / "out"),
-                    "logs_dir": str(tmp_path / "logs")}
     raw["disk_reserve_gb"] = 0
-    return Registry(raw)
+    for mid, gb in est_gb.items():
+        raw["models"][mid]["routes"][0]["est_download_gb"] = gb
+    return tmp_registry(raw)
 
 
-def test_disk_evicts_offline_weights_then_loads(tmp_path):
-    reg = _tmp_registry(tmp_path)
-    qwen = reg.models_dir / "qwen"
-    qwen.mkdir(parents=True)
-    (qwen / "w.gguf").write_bytes(b"x" * 1000)
-    # Pretend the disk only has room once qwen's weights are gone.
+def _weights(reg, model_id, nbytes):
+    d = reg.models_dir / model_id
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "w.gguf").write_bytes(b"x" * nbytes)
+    return d
+
+
+def test_disk_evicts_offline_weights_then_loads():
+    reg = _disk_registry(inkling=0.000001)  # ~1KB download
+    qwen = _weights(reg, "qwen", 2000)
     free = lambda p: 10**15 if not qwen.exists() else 0
     client, _ = make_client(free_bytes=free, registry=reg)
     with client:
         r = client.post("/admin/load", json={"id": "inkling"})
         assert r.status_code == 200, r.json()
+        assert r.json()["evicted"] == ["qwen"]
         assert not qwen.exists()
 
 
-def test_disk_rejects_when_eviction_is_not_enough(tmp_path):
-    reg = _tmp_registry(tmp_path)
-    client, _ = make_client(free_bytes=lambda p: 0, registry=reg)
+def test_disk_rejects_when_eviction_is_not_enough():
+    client, _ = make_client(free_bytes=lambda p: 0, registry=_disk_registry())
     with client:
         r = client.post("/admin/load", json={"id": "pika"})
         assert r.status_code == 409 and "磁盘不够" in r.json()["reason"]
+
+
+def test_disk_full_swap_refusal_keeps_online_model():
+    reg = _disk_registry()
+    disk = {"free": 10**15}
+    client, _ = make_client(free_bytes=lambda p: disk["free"], registry=reg)
+    with client:
+        client.post("/admin/load", json={"id": "inkling"})
+        wait_ready(client, "inkling")
+        _weights(reg, "inkling", 1000)
+        disk["free"] = 0
+        r = client.post("/admin/load", json={"id": "qwen"})
+        assert r.status_code == 409 and "磁盘不够" in r.json()["reason"]
+        assert client.get("/admin/status").json()["online"] == ["inkling"]
+        assert (reg.models_dir / "inkling").exists()
+
+
+def test_refused_load_keeps_cached_weights_of_offline_models():
+    reg = _disk_registry()
+    qwen = _weights(reg, "qwen", 1000)
+    client, _ = make_client(free_bytes=lambda p: 0, registry=reg)
+    with client:
+        r = client.post("/admin/load", json={"id": "pika"})
+        assert r.status_code == 409
+        assert qwen.exists()
+
+
+def test_swap_succeeds_when_deleting_the_outgoing_models_weights_makes_room():
+    reg = _disk_registry(qwen=0.000002)
+    disk = {"tight": False}
+    inkling = reg.models_dir / "inkling"
+    free = lambda p: 0 if disk["tight"] and inkling.exists() else 10**15
+    client, _ = make_client(free_bytes=free, registry=reg)
+    with client:
+        client.post("/admin/load", json={"id": "inkling"})
+        wait_ready(client, "inkling")
+        _weights(reg, "inkling", 5000)
+        disk["tight"] = True
+        r = client.post("/admin/load", json={"id": "qwen"})
+        assert r.status_code == 200, r.json()
+        assert r.json()["unloaded"] == ["inkling"] and r.json()["evicted"] == ["inkling"]
+        assert not inkling.exists()
+        assert wait_ready(client, "qwen")["online"] == ["qwen"]
 
 
 def test_model_list_polling_does_not_reset_idle():

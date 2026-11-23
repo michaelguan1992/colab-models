@@ -7,6 +7,8 @@ import shlex
 import signal
 import subprocess
 import time
+from dataclasses import dataclass
+from typing import Literal
 
 import httpx
 
@@ -28,11 +30,45 @@ def _pid() -> int | None:
         return None
 
 
-def healthy(cfg: Config, timeout: float = 3) -> bool:
+SERVICE = "lm-controller"
+
+
+class PortConflict(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Probe:
+    state: Literal["down", "ours", "foreign"]
+    version: str = ""
+
+
+def probe(cfg: Config, timeout: float = 3) -> Probe:
     try:
-        return httpx.get(f"{cfg.base_url}/health", timeout=timeout).status_code == 200
+        r = httpx.get(f"{cfg.base_url}/health", timeout=timeout)
     except httpx.HTTPError:
-        return False
+        return Probe("down")
+    if r.status_code != 200:
+        return Probe("down")
+    try:
+        body = r.json()
+    except ValueError:
+        return Probe("foreign")
+    if isinstance(body, dict) and body.get("service") == SERVICE:
+        return Probe("ours", str(body.get("version", "")))
+    # Controllers before /health carried an identity answered exactly {"ok": true}; an empty
+    # version makes lm up redeploy over them instead of refusing the port.
+    if body == {"ok": True}:
+        return Probe("ours", "")
+    return Probe("foreign")
+
+
+def healthy(cfg: Config, timeout: float = 3) -> bool:
+    return probe(cfg, timeout).state == "ours"
+
+
+def conflict_message(cfg: Config) -> str:
+    return f"本地端口 {cfg.local_port} 被其他程序占用。在 config.toml 里改 local_port 换一个端口。"
 
 
 def _host(cfg: Config) -> str:
@@ -47,16 +83,22 @@ def master_alive(cfg: Config) -> bool:
     return r.returncode == 0
 
 
-def run(cfg: Config, command: str, capture: bool = False) -> subprocess.CompletedProcess | None:
+def run(cfg: Config, command: str, capture: bool = False,
+        input: str | None = None) -> subprocess.CompletedProcess | None:
     """Run a remote shell command over the tunnel's master connection; None if no master."""
     if not master_alive(cfg):
         return None
     return subprocess.run(["ssh", "-S", str(CONTROL_PATH), "-o", "LogLevel=ERROR", _host(cfg),
-                           shlex.join(["bash", "-lc", command])], text=True, capture_output=capture)
+                           shlex.join(["bash", "-lc", command])], text=True, capture_output=capture,
+                          input=input)
 
 
-def start(cfg: Config, proxy_command: str, wait_s: float = 60) -> None:
+def start(cfg: Config, proxy_command: str, wait_s: float = 60, require_health: bool = True) -> None:
+    """Open the tunnel. require_health=False only waits for the ssh master, for use before the
+    controller exists (deploy runs over the master)."""
     stop()
+    if probe(cfg).state == "foreign":
+        raise PortConflict(conflict_message(cfg))
     CONTROL_PATH.unlink(missing_ok=True)
     cmd = [
         "ssh", "-N",
@@ -80,7 +122,7 @@ def start(cfg: Config, proxy_command: str, wait_s: float = 60) -> None:
     while time.time() < deadline:
         if p.poll() is not None:
             raise RuntimeError(f"ssh 隧道退出 (code {p.returncode})，见 {LOG_FILE}")
-        if healthy(cfg):
+        if (healthy(cfg) if require_health else master_alive(cfg)):
             return
         time.sleep(1)
     raise RuntimeError(f"{wait_s:.0f}s 内隧道未连通，见 {LOG_FILE}")
