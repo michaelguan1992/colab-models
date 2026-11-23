@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import posixpath
 import random
@@ -31,8 +32,8 @@ SESSION_STATE = STATE_DIR / "session.json"
 WATCHDOG_PID = STATE_DIR / "watchdog.pid"
 WATCHDOG_LOG = STATE_DIR / "watchdog.log"
 
-STATE_ICON = {"ready": "● 在线", "offline": "○ 离线", "downloading": "◐ 下载中", "starting": "◑ 启动中",
-              "stopping": "◌ 停止中", "error": "✕ 错误", "pending": "◌ 排队"}
+STATE_ICON = {"ready": "● 在线", "offline": "○ 离线", "installing": "◐ 安装引擎", "downloading": "◐ 下载中",
+              "starting": "◑ 启动中", "stopping": "◌ 停止中", "error": "✕ 错误", "pending": "◌ 排队"}
 
 
 WATCHDOG_POLL_S = 60
@@ -120,14 +121,15 @@ def _label(acc: dict) -> str:
     return acc["gpu"] + (" high-mem" if acc.get("high_mem") else "")
 
 
-def acquire(cfg: Config, colab: Colab, wait: bool) -> bool:
+def acquire(cfg: Config, colab: Colab, wait: float | None) -> bool:
     """Get a runtime from cfg.accelerators, in order. One request per accelerator per round.
 
     Capacity errors (503) move on to the next accelerator; with --wait, a new round starts
-    after ~assign_retry_minutes. A daily request cap keeps us far from the rapid-retry
+    after ~assign_retry_minutes, for at most ``wait`` minutes (inf: until the daily cap). A daily request cap keeps us far from the rapid-retry
     pattern that got other accounts restricted (colabtools#6206).
     """
     accs = list(cfg.accelerators)
+    deadline = time.monotonic() + wait * 60 if wait else None
     rnd = 0
     while True:
         rnd += 1
@@ -164,9 +166,12 @@ def acquire(cfg: Config, colab: Colab, wait: bool) -> bool:
             print("所有备选 GPU 都被拒绝，请检查 accelerators 配置")
             return False
         if not wait:
-            print("这一轮都没分到。稍后再运行 `lm up`，或用 `lm up --wait` 自动按间隔重试。")
+            print("这一轮都没分到。稍后再运行 `lm up`，或用 `lm up --wait [分钟]` 自动按间隔重试。")
             return False
         delay = cfg.assign_retry_minutes * 60 * random.uniform(0.8, 1.2)
+        if time.monotonic() + delay > deadline:
+            print(f"等了 {wait:.0f} 分钟仍没分到 GPU，放弃。")
+            return False
         print(f"第 {rnd} 轮没分到，{delay / 60:.0f} 分钟后重试（Ctrl-C 放弃）…", flush=True)
         time.sleep(delay)
 
@@ -502,7 +507,7 @@ def cmd_dsh(cfg: Config, a) -> int:
     return subprocess.call(cmd, env=env)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lm", description="Colab G4 模型一键启停")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -510,7 +515,8 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("model", nargs="?", help="要加载的模型（默认取配置 default_model）")
     s.add_argument("--no-load", action="store_true", help="只开机，不加载模型")
     s.add_argument("--open", action="store_true", help="完成后启动 dsh")
-    s.add_argument("--wait", action="store_true", help="分不到 GPU 时按 assign_retry_minutes 间隔继续重试")
+    s.add_argument("--wait", nargs="?", type=float, const=math.inf, default=None, metavar="分钟",
+                   help="分不到 GPU 时按 assign_retry_minutes 间隔继续重试；可给最长等待分钟数，不给则等到当天次数上限")
     s.set_defaults(fn=cmd_up)
 
     s = sub.add_parser("down", help="卸载模型、关隧道、停止 Colab 会话")
@@ -561,8 +567,11 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("watchdog", help=argparse.SUPPRESS)  # spawned by `lm up`
     s.set_defaults(fn=cmd_watchdog)
+    return p
 
-    a = p.parse_args(argv)
+
+def main(argv: list[str] | None = None) -> int:
+    a = build_parser().parse_args(argv)
     cfg = load()
     try:
         if a.cmd in LOCKED_COMMANDS:

@@ -99,3 +99,40 @@ colab ssh -s localmodels -- bash -lc 'python3 -m venv /content/fv && /content/fv
 - 之后再次加载 Inkling 正常，端口和显存都已释放。
 - 修了一个旧 bug：`bootstrap.sh` 在把 `~/.local/bin` 加进 PATH 之前检查 `strata`，导致每次部署都重新下载安装 Strata（90MB）。
 - 没在真机上验证：磁盘不够时的切换、HF 受限仓库（只对真实 HF API 跑过预检）、空闲卸载等待进行中的请求、HF token 经 `colab ssh` 首次传输。
+
+## 8. 第 2 阶段真机验证（2026-11-23）
+
+### L4（sm_89）
+- llama.cpp 路线（qwen-tiny，b12651 CUDA 12.8 预编译包）：按需安装约 20 秒，下载约 10 秒，对话正常，`/v1/models` 带 `context_length`。
+- 第一次跑在 CPU 上（53 tok/s，`nvidia-smi` 看不到进程）：cudart 附加包解压在自己的目录里，不在 `LD_LIBRARY_PATH`。修复后 GPU 显存 1.7GB，生成 251 tok/s。
+- 同组切换：加载 inkling 时自动卸载 qwen-tiny（`"unloaded": ["qwen-tiny"]`）。
+- Strata 按需安装通过（installing → starting），之后会话被手动 `lm down`，没等到 ready。
+
+### G4（第一次拿到）
+- 硬件：NVIDIA RTX PRO 6000 Blackwell Server Edition，驱动 580.82.07，compute_cap 12.0，显存 97887 MiB；磁盘 236GB；内存 176GB；48 核。`hf` 在 `/usr/local/bin/hf`。
+- Inkling（strata 路线，AD-Q4_K，`--context 32k --drafting auto`）：下载约 45 秒，启动约 30 秒；显存 18.6GB；261 token 用时 2.7 秒（约 96 tok/s，含 prefill）；工具调用正常。
+- 结论：Strata v0.2.20 在 sm_120 上可用；Basalt 路线需要的 G4 条件（驱动 ≥580、CUDA 13）满足。
+
+### G4：Qwen（strata 路线）
+- 下载 77GB 约 4 分钟（约 320MB/s），启动约 3 分钟；显存 53.9GB。
+- 370 token 用时 1.9 秒（约 194 tok/s，`reasoning_effort: none`）；`high` 产生思考内容、`none` 不产生；工具调用正常。
+- Strata 自己往 `/content/models/` 根目录下载了 866MB 的 `mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf`，不在模型目录里，磁盘清理算不到它。
+
+### G4：调度与磁盘（真机）
+- Qwen 在线（54GB）时加载 Pika 被规则拒绝；之后切回 Inkling 时，规划器为 Pika（148GB）删除了离线的 Qwen 权重，空闲从 138GB 变成 210GB。
+
+### G4：Pika
+- 依次修了：Colab 的 python 没有 ensurepip（venv 改用 `--without-pip` 借系统 pip）；venv 继承了 Colab 的 torchao 0.10，peft 要求 >0.16（引擎 pip 列表加 `torchao>=0.16`）；`workflow` 应传给 `load_components`，不是 `from_pretrained`；输出要 `output=["videos","audio","sampling_rate"]` 再交给 `encode_video`。
+- 不开 offload 时 transformer（62GB）和文本编码器（62GB）一起上卡，单独加载也 OOM。开 `--cpu-offload` 后峰值 64.4GB。
+- 5 秒 480p 带音频：首次请求 498 秒（权重从磁盘懒加载），之后 80 秒；去噪每步约 3 秒。
+- diffusers 的 Pika pipeline 固定 6 步（`denoising_step_list`），不接受 `num_inference_steps` / `guidance_scale`；社区 Turbo LoRA 是按 ComfyUI 4 步 euler 调的，现在在官方 6 步调度下运行，属于非标准组合。
+- Pika 只接受 5–15 秒。
+- 与 Inkling 共存：先上 Inkling 再上 Pika 可以，生成期间 Inkling 照常回答；生成后 Pika 实测占用降到 13.8GB。反过来先上 Pika、用过一次后，它的自动 offload 会占到约 82GB，此时再加载 Inkling 会被规则 3 拒绝。
+
+### G4：Basalt v0.5.6（Inkling）
+- 转换：AtomicChat 的 GGUF 不能转（Basalt 的 GGUF 转换只支持 qwen4exp / deepseek41 / hy4flash）。改用 `OpenUncensored/Inkling-2-Mini-Uncensored`（另一份去审查，safetensors，文件结构和官方一致，含 DSpark `mtp.safetensors`），`--checkpoint` 转换 70 秒，18.3GB。转换器不在 release 包里，要从源码 `tools/convert` 取。
+- 启动：约 15 秒；显存 19.8GB；`--vision dynamic`（Inkling 的图像编码器在引擎内，`--vision 0` 会被拒绝）。
+- `/v1/models` 在加载权重时就返回 200（`status.value: loading`），就绪要等 `loaded`。
+- 速度：端到端约 260 tok/s（Strata 约 96 tok/s，约 2.7 倍）；引擎侧 317–407 tok/s，DSpark 接受率 73–96%。
+- 工具调用、看图都正常。Basalt 下 Inkling 默认开思考，`reasoning_effort` 有效（none / low / high 的思考量逐级增加）。
+- 私有仓库 `mgresearch/colab-models-basalt`（commit `4c0f85f3`）存放转换好的 `Inkling-2-Mini-Uncensored-OU.basalt`（19.6GB）。HF_TOKEN 经 ssh stdin 送到运行时（ControlMaster 路径，37 字节，权限 600）。从仓库下载约 1 分钟，启动约 10 秒，端到端约 248 tok/s。

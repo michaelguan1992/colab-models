@@ -25,8 +25,8 @@ from pydantic import BaseModel
 class GenReq(BaseModel):
     prompt: str
     image_b64: str | None = None      # optional first frame (PNG/JPEG, base64)
-    height: int = 480
-    width: int = 832
+    height: int | None = None         # None = the worker's --height
+    width: int | None = None          # None = the worker's --width
     num_frames: int = 121             # ~5 s at 24 fps
     steps: int | None = None
     seed: int | None = None
@@ -51,8 +51,10 @@ class Worker:
             manager = ComponentsManager()
             if a.cpu_offload:
                 manager.enable_auto_cpu_offload(device="cuda:0")
-            pipe = ModularPipeline.from_pretrained(a.model_dir, workflow=a.workflow, components_manager=manager)
-            pipe.load_components(dtype={"vae": torch.float32, "audio_vae": torch.float32, "default": torch.bfloat16})
+            # The workflow picks which components load; fl2va's set serves t2va (no image) and i2va/fl2va alike.
+            pipe = ModularPipeline.from_pretrained(a.model_dir, components_manager=manager)
+            pipe.load_components(workflow=a.workflow,
+                                 dtype={"vae": torch.float32, "audio_vae": torch.float32, "default": torch.bfloat16})
             # spike: Turbo LoRA is pre-fused with the Flex adapter, so load it instead of fl2va/adapter.
             pipe.load_lora_weights(a.lora_dir, weight_name=a.lora_file)
             if not a.cpu_offload:
@@ -78,8 +80,10 @@ class Worker:
         import torch
         from diffusers.utils.export_utils import encode_video
 
-        kwargs = dict(prompt=req.prompt, height=req.height, width=req.width, num_frames=req.num_frames,
-                      num_inference_steps=req.steps or self.args.steps, guidance_scale=self.args.guidance)
+        kwargs = dict(prompt=req.prompt, height=req.height or self.args.height, width=req.width or self.args.width,
+                      num_frames=req.num_frames,
+                      num_inference_steps=req.steps or self.args.steps, guidance_scale=self.args.guidance,
+                      output=["videos", "audio", "sampling_rate"])
         if req.image_b64:
             from PIL import Image
             kwargs["image"] = Image.open(io.BytesIO(base64.b64decode(req.image_b64))).convert("RGB")
@@ -87,8 +91,8 @@ class Worker:
             kwargs["generator"] = torch.Generator("cuda").manual_seed(req.seed)
         out = self.pipe(**kwargs)
         name = f"{job_id}.mp4"
-        # spike: confirm output fields (video frames + audio) and encode_video signature.
-        encode_video(out, str(Path(self.args.outputs_dir) / name), fps=24)
+        encode_video(out["videos"][0], fps=self.args.fps, output_path=str(Path(self.args.outputs_dir) / name),
+                     audio=out["audio"][0], audio_sample_rate=out["sampling_rate"])
         return name
 
 
@@ -100,6 +104,9 @@ def main() -> None:
     p.add_argument("--workflow", default="fl2va")
     p.add_argument("--steps", type=int, default=4)
     p.add_argument("--guidance", type=float, default=1.0)
+    p.add_argument("--fps", type=int, default=24)
+    p.add_argument("--width", type=int, default=832)
+    p.add_argument("--height", type=int, default=480)
     p.add_argument("--outputs-dir", default="/content/outputs")
     p.add_argument("--port", type=int, default=8090)
     p.add_argument("--cpu-offload", action="store_true")

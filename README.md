@@ -6,11 +6,12 @@
 |---|---|---|---|
 | `inkling` | AtomicChat/Inkling-2-Mini-Uncensored-GGUF（Q4_K） | Strata | ~18GB |
 | `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF（IQ3_XXS） | Strata | ~50GB |
+| `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF（Q8_0，演示用） | llama.cpp | ~2GB |
 | `pika` | Pika-H3-Flex + Turbo LoRA（4 步，**视频+音频**） | diffusers | ~69GB |
 
-**调度规则**（由 controller 强制执行，`remote/controller/policy.py`）
-1. 同一时间最多一个 LLM 在线。加载另一个 LLM 时，会先把当前的卸载掉。
-2. 只有在线 LLM 的**实测**显存低于 20GB 时，`pika` 才能上线。所以 Inkling 可以和 Pika 同时在线，Qwen 不行。
+**调度规则**（写在 `remote/models.yaml` 的 `rules`，由 controller 对"加载之后的在线集合"强制执行，`remote/controller/policy.py`）
+1. 同一时间最多一个 `llm` 组的模型在线（`max_online: 1, on_conflict: swap`）。加载另一个时，会先把同组当前的卸载掉。
+2. 只有在线 `llm` 组模型的**实测**显存低于 20GB 时，`video` 组的 `pika` 才能上线（`requires_online_below`）。所以 Inkling 可以和 Pika 同时在线，Qwen 不行。
 3. 45 分钟没有请求，自动卸载所有模型（`idle_unload_minutes`）。
 
 ## 一次性准备
@@ -35,10 +36,10 @@ lm down          # 卸载模型 + 关闭隧道 + 停止 Colab 会话（停止计
 ```
 ### 分不到 GPU 时
 G4 经常返回 503（没有空闲容量，不是账号问题）。`lm up` 按 `accelerators` 顺序每种只申请一次：先 G4，再 A100 80GB（high-mem）。都没有就退出。
-- `lm up --wait`：每隔约 `assign_retry_minutes`（默认 12 分钟，±20% 随机）再申请一轮。
+- `lm up --wait [分钟]`：每隔约 `assign_retry_minutes`（默认 12 分钟，±20% 随机）再申请一轮。给了分钟数就最多等这么久（如 `lm up --wait 120`），不给则一直等到当天的 `assign_daily_limit`。
 - 每天最多发 `assign_daily_limit`（默认 12）次申请，多次运行 `lm up` 共用这个额度。短时间内大量重试曾导致别的账号被限制（colabtools#6206）。
 - 分到的显存小于 `min_vram_gb`（默认 75）就立刻停掉，换下一种。
-- 在 A100 80GB 上，Inkling 和 Pika 不能同时在线（规则 3：在线模型加目标模型的显存，不能超过 GPU 总显存减余量）。
+- 在 A100 80GB 上，Inkling 和 Pika 不能同时在线（始终生效的显存检查：在线模型加目标模型的显存，不能超过 GPU 总显存减余量）。
 
 ### 计费与自动关机
 - controller 空闲 `idle_unload_minutes`（45）分钟后只卸载模型，Colab 会话仍按小时计费（G4 约 8.9 计算单元/小时）。
@@ -62,13 +63,13 @@ default_model = "inkling"
 `lm dsh` 会带上 `dsh/plugin-colab` 插件启动 dsh web。插件提供：
 - 斜杠命令：`/up [model]`、`/down`、`/load <id>`、`/unload [id]`、`/status`
 - 给模型调用的工具：`colab_status`、`generate_video`（生成的 mp4 保存到 `./outputs/`）
-- 在线状态的显示：dsh 的模型选择器通过 `/v1/models` 发现模型，而这个接口**只列出在线的 LLM**；如果 Pika 也在线，名字后面会带 `[+pika]`。完整状态（下载进度、显存）用 `/status` 查看。
+- 在线状态的显示：dsh 的模型选择器通过 `/v1/models` 发现模型，而这个接口**只列出在线且 `serves: [chat]` 的模型**（带 `context_length`）；如果别的模型（如 Pika）也在线，名字后面会带 `[+pika]`。完整状态（下载进度、显存）用 `/status` 查看。
 
 ## 结构
 ```
 src/lm/                Mac 端 CLI（colab CLI 封装、ssh 隧道、命令）
-remote/bootstrap.sh    在 Colab 上安装依赖和 Strata，并启动 controller（可重复执行）
-remote/models.yaml     模型注册表：仓库、量化文件、启动参数、显存估计
+remote/bootstrap.sh    在 Colab 上安装 controller 依赖并启动它（可重复执行）；引擎在第一次加载用到它的模型时才安装
+remote/models.yaml     注册表：engines（怎么装、怎么起）、models（仓库、路线、caps、显存估计）、rules（调度规则）。加模型或引擎只改它
 remote/controller/     FastAPI :9000 —— /v1 反向代理、/admin、/video、调度规则
 dsh/plugin-colab/      dsh 插件（斜杠命令 + 工具）
 ```

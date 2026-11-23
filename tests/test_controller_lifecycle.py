@@ -8,13 +8,13 @@ import httpx
 import yaml
 
 from controller.app import tracked_stream
-from controller.backends.pika import PikaBackend
-from controller.backends.strata import StrataBackend
+from controller.backends.jobs import JobsBackend
+from controller.backends.server import ServerBackend
 from controller.cleanup import SystemReaper, reap_stale
 from controller.hf import classify_hf_error, hf_preflight
 from controller.state import StateFile
-from ctl_helpers import (REGISTRY_YAML, FakeBackend, FakeReaper, make_client, make_manager,
-                         tmp_registry, wait_ready)
+from ctl_helpers import (REGISTRY_YAML, FakeBackend, FakeReaper, build, make_client, make_manager,
+                         offline_installer, tmp_registry, wait_ready)
 
 
 def wait_state(client, model_id, state):
@@ -35,6 +35,12 @@ class FailingBackend(FakeBackend):
 class StuckDownload(FakeBackend):
     async def start(self):
         self.state = "downloading"
+        await asyncio.sleep(3600)
+
+
+class StuckInstall(FakeBackend):
+    async def start(self):
+        self.state = "installing"
         await asyncio.sleep(3600)
 
 
@@ -91,6 +97,7 @@ def test_503_texts_list_registry_ids():
     raw = yaml.safe_load(REGISTRY_YAML.read_text())
     raw["models"]["alpha"] = raw["models"].pop("inkling")
     raw["models"].pop("qwen")
+    raw["models"].pop("qwen-tiny")
     raw["models"]["clip"] = raw["models"].pop("pika")
     client, _ = make_client(registry=tmp_registry(raw))
     with client:
@@ -152,7 +159,7 @@ def test_state_file_write_is_atomic_and_tolerates_corruption(tmp_path):
 def test_startup_cleanup_reaps_recorded_and_registry_ports_before_autoload():
     reg = tmp_registry()
     sf = StateFile(reg.state_file)
-    sf.set("pika", {"engine": "pika", "port": 8090, "pids": [4242, 4243]})
+    sf.set("pika", {"engine": "diffusers", "port": 8090, "pids": [4242, 4243]})
     sf.set("inkling", {"engine": "strata", "port": 8081, "pids": [5000]})
     client, mgr = make_client(registry=reg, autoload="inkling")
     with client:
@@ -160,6 +167,7 @@ def test_startup_cleanup_reaps_recorded_and_registry_ports_before_autoload():
         calls = mgr.reaper.calls
         assert ("pids", (4242, 4243)) in calls
         assert {("strata", 8081), ("strata", 8082)} <= set(calls)
+        assert not [c for c in calls if c[0] in ("llama-cpp", "diffusers")]  # engines without `stop` are not swept
         assert ("pids", (5000,)) not in calls
         assert list(mgr.state.read()) == ["inkling"]  # stale entries cleared before the new load recorded itself
 
@@ -177,15 +185,14 @@ def test_startup_cleanup_is_safe_with_missing_or_corrupt_state(tmp_path):
 
 def test_system_reaper_kills_recorded_process_groups():
     reg = tmp_registry()
-    reg.raw["strata"] = {"bin": "/nonexistent/strata", "stop": ["launch", "--stop", "--port", "{port}"]}
     sf = StateFile(reg.state_file)
 
     async def run():
         child = await asyncio.create_subprocess_exec("sh", "-c", "sleep 60 & echo $! > /dev/null; wait",
                                                      start_new_session=True)
-        sf.set("pika", {"engine": "pika", "port": 8090, "pids": [child.pid]})
+        sf.set("pika", {"engine": "diffusers", "port": 8090, "pids": [child.pid]})
         started = time.monotonic()
-        await reap_stale(reg, sf, SystemReaper(reg))
+        await reap_stale(reg, sf, SystemReaper(reg, offline_installer(reg)))
         await asyncio.wait_for(child.wait(), 5)
         assert time.monotonic() - started < 5
     asyncio.run(run())
@@ -268,6 +275,18 @@ def test_idle_unload_waits_for_downloads():
         await mgr.idle_check()
         assert mgr.backends == {} and mgr.idle_unloaded
     asyncio.run(run())
+
+
+def test_install_counts_as_in_flight_work_and_shows_in_status():
+    client, mgr = make_client(factory=StuckInstall)
+    with client:
+        client.post("/admin/load", json={"id": "inkling"})
+        wait_state(client, "inkling", "installing")
+        assert mgr.busy() and mgr.inflight()["loading"] == 1
+        expire(mgr)
+        client.portal.call(mgr.idle_check)
+        assert "inkling" in mgr.backends and not mgr.idle_unloaded
+        assert client.post("/admin/unload", json={"id": "inkling"}).json()["ok"]
 
 
 def test_idle_unload_waits_for_in_flight_requests_then_counts_their_end_as_activity():
@@ -380,7 +399,7 @@ def test_video_job_calls_count_as_activity():
 
 def test_pika_health_reports_queue_depth_and_busy():
     reg = tmp_registry()
-    b = PikaBackend("pika", dict(reg.routes("pika")[0].cfg), reg)
+    b = build(JobsBackend, "pika", reg)
     state = {"depth": 3}
 
     def handler(request):
@@ -398,7 +417,7 @@ def test_pika_health_reports_queue_depth_and_busy():
 
 def test_strata_ready_requires_the_expected_model_on_the_port():
     reg = tmp_registry()
-    b = StrataBackend("qwen", dict(reg.routes("qwen")[0].cfg), reg)
+    b = build(ServerBackend, "qwen", reg)
     served = {"data": [{"id": "Inkling-2-Mini-Uncensored-AD-Q4_K.gguf"}]}
 
     async def run():
@@ -414,10 +433,11 @@ def test_strata_ready_requires_the_expected_model_on_the_port():
 # ---- disk accounting for concurrent downloads --------------------------------------------------
 
 def test_other_downloads_in_progress_reduce_available_disk():
-    reg = tmp_registry()
-    reg.raw["disk_reserve_gb"] = 0
+    raw = yaml.safe_load(REGISTRY_YAML.read_text())
+    raw["disk_reserve_gb"] = 0
+    reg = tmp_registry(raw)
     gib = 1024**3
-    factory = lambda mid, cfg, r: (StuckDownload if mid == "pika" else FakeBackend)(mid, cfg, r)
+    factory = lambda model, route, r, inst: (StuckDownload if model.id == "pika" else FakeBackend)(model, route, r, inst)
     mgr = make_manager(registry=reg, free_bytes=lambda p: 160 * gib, factory=factory)
 
     async def run():

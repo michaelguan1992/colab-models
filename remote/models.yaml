@@ -1,31 +1,110 @@
-# Model registry for the Colab runtime. Edit this file to change quants or flags;
-# no code changes needed. Fields marked "spike" must be confirmed on a real G4 run
-# (see docs/spike.md).
+# Model registry for the Colab runtime. Adding a model or an engine is an edit to this file; no Python.
+# Fields marked "spike" must be confirmed on a real G4 run (see docs/spike.md).
 
 paths:
   models_dir: /content/models
   outputs_dir: /content/outputs
   logs_dir: /content/lm/logs
   state_file: /content/lm/state.json   # engines this controller started; reaped on the next controller start
-
-strata:
-  bin: strata
-  # {model_path} {port} {extra} are substituted. spike: confirm flags on sm_120.
-  launch: ["launch", "--model-path", "{model_path}", "--port", "{port}",
-           "--access", "local", "--no-api-key", "--yes", "--no-tui"]
-  stop: ["launch", "--stop", "--port", "{port}"]
+  engines_dir: /content/lm/engines     # install markers and extracted engine trees
+  venvs_dir: /content/lm/venvs
 
 idle_unload_minutes: 45   # controller unloads models; the Mac watchdog stops the session (idle_stop_minutes)
-vram_margin_gb: 4         # rule 3: online models + target must fit in (GPU total - margin)
+vram_margin_gb: 4         # always-on rule: online models + target must fit in (GPU total - margin)
 disk_reserve_gb: 10       # keep free on /content; offline models' weights are deleted to make room
+
+# An engine says how to install, launch, stop and probe one kind of server.
+#   shape: server (the controller proxies HTTP to it) | jobs (a long-job worker with /health + /jobs)
+#   install: installed lazily on the first load of a route that uses it, recorded under engines_dir.
+#     script: download + verify sha256 (sha256 or sums_url) + run, `bin` must exist afterwards
+#     archive: download + verify each archive, extract, find `bin` by name inside; its dir joins LD_LIBRARY_PATH
+#     venv: python -m venv --system-site-packages, then pip install `pip` and `pip_files` (after the weights download)
+#   launch/stop placeholders: {bin} {venv_python} {model_path} {model_dir} {port} {models_dir} {outputs_dir}
+#     {lora_dir} {lora_file}, any route `params` key as {name}, and {extra} (the route's `extra` list, as its own element)
+#   daemonizes: the launcher exits and leaves a server behind; find it through the port listener, stop it with `stop`
+#   ready: {path, identity: model_path} polls path; identity checks the served model is this route's model_path
+#   requires: {sm: [...]} limits the GPU compute capability; a route's own `requires` must hold too
+engines:
+  strata:
+    shape: server
+    apis: [openai, anthropic]
+    install:
+      kind: script
+      url: https://github.com/Niko1221/Strata/releases/download/v0.2.20/install.sh
+      sums_url: https://github.com/Niko1221/Strata/releases/download/v0.2.20/SHA256SUMS.txt
+      env: {STRATA_FEED: "https://github.com/Niko1221/Strata/releases/download/v0.2.20"}  # the installer verifies its signed packages
+      bin: "~/.local/bin/strata"
+    # spike: confirm flags on sm_120.
+    launch: ["{bin}", "launch", "--model-path", "{model_path}", "--port", "{port}",
+             "--access", "local", "--no-api-key", "--yes", "--no-tui", "{extra}"]
+    stop: ["{bin}", "launch", "--stop", "--port", "{port}"]
+    daemonizes: true
+    ready: {path: /v1/models, identity: model_path}
+
+  llama-cpp:
+    shape: server
+    apis: [openai, anthropic]
+    install:
+      kind: archive
+      url: https://github.com/ggml-org/llama.cpp/releases/download/b12651/llama-b12651-bin-ubuntu-cuda-12.8-x64.tar.gz
+      sha256: cb099350c6a025e67eefaa13f2b67b2dcce53e38a0da22476e070d166ef367ea
+      extra_archives:
+        - url: https://github.com/ggml-org/llama.cpp/releases/download/b12651/cudart-llama-b12651-bin-ubuntu-cuda-12.8-x64.tar.gz
+          sha256: 485df8f0b0ab30c15807d25fd23a821aeaef62a3947722c683429491a5e0d027
+      bin: llama-server
+    launch: ["{bin}", "-m", "{model_path}", "--port", "{port}", "--host", "127.0.0.1", "-ngl", "999", "{extra}"]
+    ready: {path: /v1/models}
+
+  basalt:
+    # Strata fork tuned for Blackwell: NVFP4 experts, DSpark/MTP drafting, image input. Main GPU must be sm_120.
+    shape: server
+    apis: [openai, anthropic]
+    requires: {sm: [120]}
+    install:
+      kind: archive
+      url: https://github.com/jesdga95/basalt/releases/download/v0.5.6/basalt-v0.5.6-linux-x64.tar.gz
+      sha256: a1f986a2dc82bbeb8db251ee87147532cf01c1f1a3ad9d955683fc0445883866
+      bin: basalt
+      requirements: requirements.txt   # the server's Python side; bin/basalt serve uses <top>/.venv
+    launch: ["{bin}", "serve", "{model_path}", "--port", "{port}", "{extra}"]
+    ready: {path: /v1/models, field: status.value, equals: loaded}   # it answers while weights still load
+
+  diffusers:
+    shape: jobs
+    install:
+      kind: venv
+      # Colab ships torchao 0.10, which the venv inherits; peft refuses anything below 0.16 when loading the LoRA.
+      pip: [fastapi, uvicorn, httpx, psutil, "torchao>=0.16"]
+      pip_files: ["{model_dir}/examples/requirements-diffusers.txt"]   # pinned diffusers commit
+    launch: ["{venv_python}", "-m", "controller.pika_worker",
+             "--model-dir", "{model_dir}", "--lora-dir", "{lora_dir}", "--lora-file", "{lora_file}",
+             "--workflow", "{workflow}", "--steps", "{steps}", "--guidance", "{guidance}",
+             "--fps", "{fps}", "--width", "{width}", "--height", "{height}",
+             "--outputs-dir", "{outputs_dir}", "--port", "{port}", "{extra}"]
+    ready: {path: /health}
 
 # Each model lists `routes` in priority order; the first whose `requires` matches the GPU is used
 # (`/admin/load` can name one). Ports are unique per model; omit `port` to get one assigned (from 8081).
+# `serves` names what the model answers (chat -> /v1/*, video -> /video/*); route `caps` override model `caps`.
 models:
   inkling:
-    kind: llm
+    group: llm
+    serves: [chat]
     display: Inkling-2-Mini Uncensored (Q4_K)
+    caps: {tools: true, vision: false, context: 32768, reasoning: []}
     routes:
+      # Basalt reads only its own .basalt packs and converts Inkling from safetensors, not GGUF, so this route
+      # runs OpenUncensored's abliteration (a different one from AtomicChat's GGUF below).
+      # Converted once with Basalt's tools/convert (--checkpoint) and kept in a private repo; needs HF_TOKEN.
+      - engine: basalt
+        repo: mgresearch/colab-models-basalt
+        revision: 4c0f85f32c0547d51dd12c322453dfd967bf6801
+        include: [Inkling-2-Mini-Uncensored-OU.basalt]
+        model_path: Inkling-2-Mini-Uncensored-OU.basalt
+        est_download_gb: 19.6
+        vram_gb: 24
+        caps: {vision: true, reasoning: [none, low, medium, high]}   # Basalt runs Inkling with thinking on; Strata does not
+        extra: ["--max-context", "32768", "--vision", "dynamic"]  # Inkling encodes images inside the engine
       - engine: strata
         repo: AtomicChat/Inkling-2-Mini-Uncensored-GGUF
         include:
@@ -37,8 +116,10 @@ models:
         extra: ["--context", "32k", "--drafting", "auto"]  # no MTP head in this GGUF; DSpark drafter needs llama.cpp
 
   qwen:
-    kind: llm
+    group: llm
+    serves: [chat]
     display: Qwen3.8-Flash-Next abliterated (IQ3_XXS)
+    caps: {tools: true, context: 32768, reasoning: [none, low, medium, high]}
     routes:
       - engine: strata
         repo: SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF
@@ -50,11 +131,26 @@ models:
         est_download_gb: 77
         extra: ["--context", "32k", "--drafting", "auto"]  # spike: dflash2 vs mtp
 
+  qwen-tiny:
+    group: llm
+    serves: [chat]
+    display: Qwen3-0.6B (llama.cpp demo)
+    caps: {context: 8192}
+    routes:
+      - engine: llama-cpp
+        repo: Qwen/Qwen3-0.6B-GGUF
+        include: [Qwen3-0.6B-Q8_0.gguf]
+        model_path: Qwen3-0.6B-Q8_0.gguf
+        vram_gb: 2
+        est_download_gb: 0.7
+        extra: ["-c", "8192"]
+
   pika:
-    kind: video
+    group: video
+    serves: [video]
     display: Pika-H3-Flex + Turbo LoRA (4-step)
     routes:
-      - engine: pika
+      - engine: diffusers
         repo: Pika-Labs/Pika-H3-Flex
         # FL2VA/T2V only. Sizes (HF API, 2026-11): transformer 66.3GB, text_encoder 66.7GB
         # (Qwen3-VL-32B BF16), vae 10.4GB, audio_vae 0.6GB. Skipped: transformer_ref/ 66.3GB,
@@ -73,11 +169,18 @@ models:
         lora:
           repo: Pika-Labs/Pika-H3-Flex-Turbo-LoRA
           file: pika_h3_flex_turbo_4step_fl2va.safetensors
-        workflow: fl2va
-        steps: 4
-        guidance: 1.0
+        params: {workflow: fl2va, steps: 4, guidance: 1.0, fps: 24, width: 832, height: 480}  # worker defaults; a /video request overrides width/height
         port: 8090
-        vram_gb: 69
+        vram_gb: 66   # measured peak 64.4GB on G4 with --cpu-offload (480p, 5 s)
+        # Transformer (66GB) and text encoder (67GB, BF16) do not fit together on 96GB; take turns on the GPU.
+        extra: ["--cpu-offload"]
         est_download_gb: 148       # 144GB base subset + 3.9GB Turbo LoRA
         # Alternative under evaluation: FastVideo/Pika-H3-Flex-NVFP4-QAD (~68GB, FastVideo engine,
         # fixed 6 steps, no Turbo). See docs/spike.md §6 before switching.
+
+# Invariants on the online set after a load. max_online + on_conflict: swap unloads only same-group
+# members; without swap the load is refused. requires_online_below: while any member of `group` is
+# online, every online member of the named group must use less than vram_gb (measured, else estimated).
+rules:
+  - {group: llm, max_online: 1, on_conflict: swap}
+  - {group: video, requires_online_below: {group: llm, vram_gb: 20}}

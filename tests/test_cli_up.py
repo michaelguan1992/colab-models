@@ -26,10 +26,19 @@ class FakeColab:
         self.stopped += 1
 
 
+class Unloaded:
+    def json(self):
+        return {"unloaded": []}
+
+    def raise_for_status(self):
+        pass
+
+
 @pytest.fixture
 def env(monkeypatch, tmp_path):
     fake = FakeColab()
-    state = {"probe": tunnel.Probe("ours", "v-local"), "healthy": True, "master": True, "starts": [], "loads": []}
+    state = {"probe": tunnel.Probe("ours", "v-local"), "healthy": True, "master": True, "starts": [], "loads": [],
+             "api": []}
     monkeypatch.setattr(cli, "Colab", lambda cfg: fake)
     monkeypatch.setattr(cli, "SESSION_STATE", tmp_path / "session.json")
     monkeypatch.setattr(cli, "start_watchdog", lambda cfg: None)
@@ -39,6 +48,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(tunnel, "healthy", lambda cfg, timeout=3: state["healthy"])
     monkeypatch.setattr(tunnel, "master_alive", lambda cfg: state["master"])
     monkeypatch.setattr(tunnel, "start", lambda cfg, proxy, **kw: state["starts"].append(kw))
+    monkeypatch.setattr(cli, "api", lambda cfg, method, path, **kw: state["api"].append((method, path)) or Unloaded())
     return fake, state
 
 
@@ -101,12 +111,13 @@ def test_unknown_session_state_does_not_acquire(env, monkeypatch):
 
 
 def test_down_on_unknown_state_still_stops_and_reports(env, monkeypatch, capsys):
-    fake, _ = env
+    fake, state = env
     fake.active = None
     monkeypatch.setattr(tunnel, "stop", lambda: False)
     monkeypatch.setattr(cli, "stop_watchdog", lambda: None)
     assert cli.cmd_down(Config(), type("A", (), {"keep_session": False})()) == 0
     assert fake.stopped == 1
+    assert ("POST", "/admin/unload") in state["api"]
     assert "无法确认会话状态" in capsys.readouterr().out
 
 

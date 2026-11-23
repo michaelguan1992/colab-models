@@ -66,3 +66,13 @@ async def kill_group(pgid: int, grace: float = 10.0) -> None:
         if not _group_alive(pgid):
             return
         await asyncio.sleep(0.1)
+
+
+async def run_quiet(argv: list[str], timeout: float = 60.0) -> None:
+    """Run a short helper command (an engine's stop); a missing binary or a hang is not an error."""
+    try:
+        p = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.DEVNULL,
+                                                 stderr=asyncio.subprocess.DEVNULL)
+        await asyncio.wait_for(p.wait(), timeout=timeout)
+    except (OSError, asyncio.TimeoutError):
+        pass

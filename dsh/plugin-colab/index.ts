@@ -33,7 +33,7 @@ export const Config: Schema<Config> = Schema.object({
 })
 
 type ModelStatus = {
-  id: string; kind: string; display: string; state: string
+  id: string; group: string; serves: string[]; display: string; state: string
   vram_gb?: number | null; error?: string | null; download_progress?: number | null
 }
 type Status = {
@@ -42,7 +42,7 @@ type Status = {
 }
 
 const ICON: Record<string, string> = {
-  ready: '● 在线', offline: '○ 离线', downloading: '◐ 下载中', starting: '◑ 启动中',
+  ready: '● 在线', offline: '○ 离线', installing: '◐ 安装引擎', downloading: '◐ 下载中', starting: '◑ 启动中',
   stopping: '◌ 停止中', error: '✕ 错误', pending: '◌ 排队',
 }
 

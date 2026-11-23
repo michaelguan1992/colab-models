@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import os
 import socket
 import time
@@ -7,20 +8,23 @@ import pytest
 
 from controller.backends import base as base_mod
 from controller.backends.base import Backend
-from controller.backends.strata import served_model_matches
+from controller.backends.server import served_model_matches
 from controller.procs import pid_alive
-from ctl_helpers import tmp_registry
+from ctl_helpers import build
 
 
 class SleepBackend(Backend):
     """download() runs `sh` with a background `sleep` child, like `hf download` with its workers."""
 
-    def __init__(self, model_id, cfg, registry, pidfile):
-        super().__init__(model_id, cfg, registry)
+    def __init__(self, model, route, registry, installer, pidfile):
+        super().__init__(model, route, registry, installer)
         self.pidfile = pidfile
 
     async def download(self):
         await self._run_logged(["sh", "-c", f"sleep 30 & echo $! > {self.pidfile}; wait"])
+
+    async def _install(self):
+        pass
 
     async def _launch(self):
         await self._spawn(["sh", "-c", "sleep 30"])
@@ -29,9 +33,8 @@ class SleepBackend(Backend):
         return False
 
 
-def make(tmp_path, port=18999):
-    reg = tmp_registry()
-    return SleepBackend("inkling", {"port": port}, reg, tmp_path / "child.pid")
+def make(tmp_path):
+    return build(SleepBackend, pidfile=tmp_path / "child.pid")
 
 
 async def child_pid(b):
@@ -72,7 +75,7 @@ def test_cancelling_the_start_task_kills_the_download_child(tmp_path):
         with pytest.raises(asyncio.CancelledError):
             await task
         assert await gone(pid), "download child survived cancellation"
-        assert b.state == "stopped" and not b._download_pgids
+        assert b.state == "stopped" and not b._job_pgids
     asyncio.run(run())
 
 
@@ -101,7 +104,7 @@ def test_wait_released_sees_port_and_pids(tmp_path):
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             s.listen()
-            b.cfg["port"] = s.getsockname()[1]
+            b.route = dataclasses.replace(b.route, port=s.getsockname()[1])
             assert not b.released()
             assert not await b.wait_released(0.3, poll=0.05)
         assert b.released()

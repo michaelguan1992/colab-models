@@ -10,25 +10,8 @@ if [ ! -f /content/lm/.deps_ok ]; then
   touch /content/lm/.deps_ok
 fi
 
-# Pinned: Strata ships several releases a day. Bump STRATA_VERSION deliberately.
-STRATA_VERSION="${STRATA_VERSION:-v0.2.20}"
-export PATH="$HOME/.local/bin:$PATH"
-if ! command -v strata >/dev/null 2>&1; then
-  feed="https://github.com/Niko1221/Strata/releases/download/$STRATA_VERSION"
-  curl -fsSL --connect-timeout 15 --max-time 120 "$feed/install.sh" -o /tmp/strata-install.sh
-  curl -fsSL --connect-timeout 15 --max-time 60 "$feed/SHA256SUMS.txt" -o /tmp/strata-SHA256SUMS.txt
-  want=$(awk '$2=="install.sh"{print $1}' /tmp/strata-SHA256SUMS.txt)
-  got=$(sha256sum /tmp/strata-install.sh | cut -d' ' -f1)
-  [ -n "$want" ] && [ "$want" = "$got" ] || { echo "strata install.sh checksum mismatch" >&2; exit 1; }
-  # The installer verifies the signed packages it downloads from the same feed.
-  STRATA_FEED="$feed" sh /tmp/strata-install.sh
-  # installer may put the binary in ~/.local/bin
-  export PATH="$HOME/.local/bin:$PATH"
-fi
-
 # (Re)start the controller detached from this ssh session.
 pkill -f "python3 -m controller" 2>/dev/null || true
-export PATH="$HOME/.local/bin:$PATH"
 # Reported by /health so the Mac can tell whether the running controller matches this checkout.
 export LM_VERSION="${LM_VERSION:-$(find . -type f \( -name '*.py' -o -name '*.yaml' -o -name '*.sh' \) -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)}"
 setsid nohup python3 -m controller --config models.yaml --port "${LM_PORT:-9000}" ${LOAD:+--load "$LOAD"} \

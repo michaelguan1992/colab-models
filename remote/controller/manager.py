@@ -13,15 +13,19 @@ import httpx
 
 from . import gpu as gpu_mod
 from .backends.base import Backend
+from .backends.jobs import JobsBackend
+from .backends.server import ServerBackend
 from .cleanup import Reaper, SystemReaper, reap_stale
 from .hf import hf_preflight
+from .install import Installer
 from .policy import GiB, DiskView, Online, Plan, Spec, plan_load, plan_rules, violations
 from .registry import Registry
+from .spec import ModelSpec, Route
 from .state import StateFile
 
 log = logging.getLogger("lm.controller")
 
-BackendFactory = Callable[[str, dict, Registry], Backend]
+BackendFactory = Callable[[ModelSpec, Route, Registry, Installer], Backend]
 HfCheck = Callable[[str, "str | None"], "str | None"]
 
 
@@ -36,11 +40,12 @@ def disk_free(path: Path) -> int:
     return shutil.disk_usage(path).free
 
 
-def default_factory(model_id: str, cfg: dict, registry: Registry) -> Backend:
-    from .backends.pika import PikaBackend
-    from .backends.strata import StrataBackend
+def default_factory(model: ModelSpec, route: Route, registry: Registry, installer: Installer) -> Backend:
+    cls = {"server": ServerBackend, "jobs": JobsBackend}[registry.engines[route.engine].shape]
+    return cls(model, route, registry, installer)
 
-    return {"strata": StrataBackend, "pika": PikaBackend}[cfg["engine"]](model_id, cfg, registry)
+
+LOADING_STATES = ("installing", "downloading", "starting")
 
 
 class RequestHandle:
@@ -70,13 +75,15 @@ class Manager:
                  free_bytes: Callable[[Path], int] = disk_free,
                  hf_check: HfCheck = hf_preflight,
                  reaper: Reaper | None = None,
-                 state: StateFile | None = None) -> None:
+                 state: StateFile | None = None,
+                 installer: Installer | None = None) -> None:
         self.registry = registry
         self.factory = factory
         self.probe = probe
         self.free_bytes = free_bytes
         self.hf_check = hf_check
-        self.reaper = reaper or SystemReaper(registry)
+        self.installer = installer or Installer(registry)
+        self.reaper = reaper or SystemReaper(registry, self.installer)
         self.state = state or StateFile(registry.state_file)
         self.backends: dict[str, Backend] = {}
         self.tasks: dict[str, asyncio.Task] = {}
@@ -97,7 +104,7 @@ class Manager:
 
     def inflight(self) -> dict[str, int]:
         return {
-            "loading": sum(1 for b in self.backends.values() if b.state in ("downloading", "starting")),
+            "loading": sum(1 for b in self.backends.values() if b.state in LOADING_STATES),
             "requests": self.requests_inflight,
             "jobs": sum(b.queue_depth for b in self.backends.values() if b.state == "ready"),
         }
@@ -113,26 +120,23 @@ class Manager:
 
     def online(self, snap: gpu_mod.GpuSnapshot | None = None) -> list[Online]:
         per_pid = (snap or self.probe()).per_pid_gb
-        return [Online(b.id, b.kind, b.vram_gb(per_pid)) for b in self._live()]
+        return [Online(b.id, b.model.group, b.vram_gb(per_pid)) for b in self._live()]
 
     def _specs(self) -> dict[str, Spec]:
         """Registry estimates, overridden by the route each live backend actually runs."""
         specs = dict(self.registry.specs)
         for b in self.backends.values():
-            specs[b.id] = Spec(b.id, b.cfg["kind"], float(b.cfg["est_vram_gb"]))
+            specs[b.id] = Spec(b.id, b.model.group, b.route.vram_gb)
         return specs
 
-    def active_llm(self) -> Backend | None:
-        for b in self.backends.values():
-            if b.kind == "llm" and b.state == "ready":
-                return b
-        return None
+    def serving(self, capability: str) -> list[Backend]:
+        """Ready backends whose model serves ``capability``, in registry order."""
+        return [b for mid in self.registry.models
+                if (b := self.backends.get(mid)) and b.state == "ready" and capability in b.model.serves]
 
-    def active_video(self) -> Backend | None:
-        for b in self.backends.values():
-            if b.kind == "video" and b.state == "ready":
-                return b
-        return None
+    def loading(self, capability: str) -> list[Backend]:
+        return [b for mid in self.registry.models
+                if (b := self.backends.get(mid)) and b.state in LOADING_STATES and capability in b.model.serves]
 
     # ---- startup ---------------------------------------------------------
     async def startup_cleanup(self) -> None:
@@ -153,13 +157,13 @@ class Manager:
             choice = self.registry.choose(model_id, snap.compute_cap, route)
             if choice.route is None:
                 return self._refuse(model_id, choice.reason)
-            cfg = dict(choice.route.cfg)
+            model, route = self.registry.model(model_id), choice.route
 
-            why = await self._hf_refusal(cfg)
+            why = await self._hf_refusal(route)
             if why:
                 return self._refuse(model_id, why)
 
-            plan = self._plan(model_id, cfg, snap, swap)
+            plan = self._plan(model, route, snap, swap)
             if not plan.ok:
                 return self._refuse(model_id, plan.reason)
 
@@ -178,11 +182,11 @@ class Manager:
             if plan.evict:
                 self._log(f"磁盘不够，已删除离线模型的权重：{', '.join(plan.evict)}")
 
-            backend = self.factory(model_id, cfg, self.registry)
+            backend = self.factory(model, route, self.registry, self.installer)
             backend.on_launch = self._record
             self.backends[model_id] = backend
             self.tasks[model_id] = asyncio.create_task(self._start(backend))
-            self._log(f"开始加载 {model_id}（路线 {cfg['route']}）"
+            self._log(f"开始加载 {model_id}（路线 {route.name}）"
                       + (f"（已卸载 {', '.join(plan.unload)}）" if plan.unload else ""))
             return plan
 
@@ -190,12 +194,10 @@ class Manager:
         self._log(f"拒绝加载 {model_id}: {reason}")
         return Plan(False, reason=reason)
 
-    async def _hf_refusal(self, cfg: dict[str, Any]) -> str | None:
-        if cfg.get("skip_download"):
-            return None
-        sources = [(cfg["repo"], cfg.get("revision"))] if cfg.get("repo") else []
-        if cfg.get("lora"):
-            sources.append((cfg["lora"]["repo"], cfg["lora"].get("revision")))
+    async def _hf_refusal(self, route: Route) -> str | None:
+        sources = [(route.repo, route.revision)] if route.repo else []
+        if route.lora:
+            sources.append((route.lora.repo, route.lora.revision))
         for repo, revision in sources:
             try:
                 reason = await asyncio.wait_for(asyncio.to_thread(self.hf_check, repo, revision), timeout=30)
@@ -211,22 +213,23 @@ class Manager:
         base = self.registry.models_dir
         return [base / model_id, base / f"{model_id}-lora"]
 
-    def _plan(self, model_id: str, cfg: dict[str, Any], snap: gpu_mod.GpuSnapshot, swap: bool) -> Plan:
-        target = Spec(model_id, cfg["kind"], float(cfg["est_vram_gb"]))
-        specs = {**self._specs(), model_id: target}
+    def _plan(self, model: ModelSpec, route: Route, snap: gpu_mod.GpuSnapshot, swap: bool) -> Plan:
+        target = Spec(model.id, model.group, route.vram_gb)
+        specs = {**self._specs(), model.id: target}
         online = self.online(snap)
-        unloading = set(plan_rules(target, online, specs, swap).unload)
-        disk = self._disk_view(model_id, cfg, unloading)
-        return plan_load(target, online, specs, swap=swap, disk=disk,
+        rules = self.registry.rules
+        unloading = set(plan_rules(target, online, specs, rules, swap).unload)
+        disk = self._disk_view(model.id, route, unloading)
+        return plan_load(target, online, specs, rules, swap=swap, disk=disk,
                          total_gb=snap.total_gb if snap.available else None,
                          margin_gb=self.registry.vram_margin_gb)
 
-    def _disk_view(self, model_id: str, cfg: dict[str, Any], unloading: set[str]) -> DiskView:
+    def _disk_view(self, model_id: str, route: Route, unloading: set[str]) -> DiskView:
         sizes = {m: sum(dir_size(d) for d in self._weight_dirs(m)) for m in self.registry.models}
-        skip = bool(cfg.get("skip_download"))
-        need = 0 if skip else max(0, int(cfg["est_download_gb"] * GiB) - sizes[model_id])
-        reserve = 0 if skip else int(self.registry.disk_reserve_gb * GiB)
-        inflight = sum(max(0, int(b.cfg["est_download_gb"] * GiB) - sizes.get(b.id, 0))
+        downloads = route.repo is not None
+        need = max(0, int(route.est_download_gb * GiB) - sizes[model_id]) if downloads else 0
+        reserve = int(self.registry.disk_reserve_gb * GiB) if downloads else 0
+        inflight = sum(max(0, int(b.route.est_download_gb * GiB) - sizes.get(b.id, 0))
                        for b in self.backends.values()
                        if b.state == "downloading" and b.id != model_id and b.id not in unloading)
         return DiskView(free_bytes=self.free_bytes(self.registry.models_dir), weights_bytes=sizes,
@@ -237,7 +240,7 @@ class Manager:
         pids = backend.pids()
         backend.recorded_pids |= pids
         self.state.set(backend.id, {
-            "route": backend.cfg.get("route"), "engine": backend.cfg.get("engine"),
+            "route": backend.route.name, "engine": backend.route.engine,
             "port": backend.port, "pids": sorted(pids), "started_at": backend.started_at,
         })
 
@@ -250,7 +253,7 @@ class Manager:
         self._record(backend)
         self._log(f"{backend.id} 已上线")
         # Post-load check with measured VRAM (rule 2 uses real numbers).
-        bad = violations(self.online(), self._specs())
+        bad = violations(self.online(), self._specs(), self.registry.rules)
         if bad:
             async with self.lock:
                 if self.backends.get(backend.id) is not backend:
@@ -336,25 +339,25 @@ class Manager:
     def status(self) -> dict[str, Any]:
         snap = self.probe()
         models = []
-        for mid, cfg in self.registry.models.items():
+        for mid, model in self.registry.models.items():
             b = self.backends.get(mid)
-            routes = self.registry.routes(mid)
             entry: dict[str, Any] = {
-                "id": mid, "kind": cfg["kind"], "display": cfg.get("display", mid),
+                "id": mid, "group": model.group, "serves": list(model.serves), "display": model.display,
                 "state": b.state if b else "offline",
-                "routes": [r.name for r in routes],
+                "routes": [r.name for r in model.routes],
             }
             if b:
-                entry.update(route=b.cfg.get("route"), est_vram_gb=b.cfg["est_vram_gb"],
-                             vram_gb=b.vram_gb(snap.per_pid_gb), error=b.error)
+                entry.update(route=b.route.name, engine=b.route.engine, caps=dict(b.route.caps),
+                             est_vram_gb=b.route.vram_gb, vram_gb=b.vram_gb(snap.per_pid_gb), error=b.error)
                 if b.state == "downloading":
                     entry["download_progress"] = b.download_progress()
                 if b.ready_at:
                     entry["online_since"] = b.ready_at
             else:
                 choice = self.registry.choose(mid, snap.compute_cap)
-                chosen = choice.route or routes[0]
-                entry.update(route=choice.route.name if choice.route else None, est_vram_gb=chosen.vram_gb)
+                chosen = choice.route or model.routes[0]
+                entry.update(route=choice.route.name if choice.route else None, engine=chosen.engine,
+                             caps=dict(chosen.caps), est_vram_gb=chosen.vram_gb)
                 if choice.route is None:
                     entry["route_reason"] = choice.reason
             models.append(entry)

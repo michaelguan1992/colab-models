@@ -1,5 +1,8 @@
 import asyncio
+import copy
+import json
 
+import httpx
 import yaml
 
 from ctl_helpers import (REGISTRY_YAML, make_client, make_manager,
@@ -96,7 +99,8 @@ def _disk_registry(**est_gb):
     raw = yaml.safe_load(REGISTRY_YAML.read_text())
     raw["disk_reserve_gb"] = 0
     for mid, gb in est_gb.items():
-        raw["models"][mid]["routes"][0]["est_download_gb"] = gb
+        for route in raw["models"][mid]["routes"]:
+            route["est_download_gb"] = gb
     return tmp_registry(raw)
 
 
@@ -175,3 +179,131 @@ def test_model_list_polling_does_not_reset_idle():
         mgr.last_activity -= 1000
         client.get("/v1/models")
         assert client.get("/admin/status").json()["idle_seconds"] >= 999
+
+
+# ---- API surface follows `serves`, not a model kind ----------------------------------------------
+
+def streamed(obj):
+    async def body():
+        yield json.dumps(obj).encode()
+    return httpx.Response(200, content=body())
+
+
+def raw_registry():
+    return copy.deepcopy(yaml.safe_load(REGISTRY_YAML.read_text()))
+
+
+def test_models_endpoint_lists_online_chat_models_with_context_length():
+    client, _ = make_client()
+    with client:
+        for mid in ("inkling", "pika"):
+            client.post("/admin/load", json={"id": mid})
+            wait_ready(client, mid)
+        data = client.get("/v1/models").json()["data"]
+        assert [m["id"] for m in data] == ["inkling"]
+        assert data[0]["context_length"] == 32768
+
+
+def test_models_endpoint_omits_context_length_when_caps_lack_it():
+    raw = raw_registry()
+    del raw["models"]["inkling"]["caps"]["context"]
+    client, _ = make_client(registry=tmp_registry(raw))
+    with client:
+        client.post("/admin/load", json={"id": "inkling"})
+        wait_ready(client, "inkling")
+        assert "context_length" not in client.get("/v1/models").json()["data"][0]
+
+
+def test_status_reports_group_serves_caps_and_engine_per_model():
+    raw = raw_registry()
+    next(r for r in raw["models"]["inkling"]["routes"] if r["engine"] == "strata")["caps"] = {"vision": True}
+    client, _ = make_client(registry=tmp_registry(raw))
+    with client:
+        models = {m["id"]: m for m in client.get("/admin/status").json()["models"]}
+        assert "kind" not in models["inkling"]
+        assert (models["inkling"]["group"], models["inkling"]["serves"], models["inkling"]["engine"]) == \
+            ("llm", ["chat"], "strata")
+        assert models["inkling"]["caps"]["vision"] is True and models["qwen"]["caps"]["reasoning"] == \
+            ["none", "low", "medium", "high"]
+        assert (models["pika"]["group"], models["pika"]["serves"], models["pika"]["engine"]) == \
+            ("video", ["video"], "diffusers")
+        assert models["qwen-tiny"]["engine"] == "llama-cpp" and models["qwen-tiny"]["caps"] == {"context": 8192}
+        client.post("/admin/load", json={"id": "inkling"})
+        wait_ready(client, "inkling")
+        online = next(m for m in client.get("/admin/status").json()["models"] if m["id"] == "inkling")
+        assert online["engine"] == "strata" and online["caps"]["vision"] is True
+
+
+def test_group_names_mean_nothing_to_the_code():
+    raw = raw_registry()
+    for m in raw["models"].values():
+        m["group"] = {"llm": "text", "video": "clips"}[m["group"]]
+    raw["rules"] = [{"group": "text", "max_online": 1, "on_conflict": "swap"},
+                    {"group": "clips", "requires_online_below": {"group": "text", "vram_gb": 20}}]
+    client, _ = make_client(registry=tmp_registry(raw))
+    with client:
+        client.post("/admin/load", json={"id": "qwen"})
+        wait_ready(client, "qwen")
+        r = client.post("/admin/load", json={"id": "pika"})
+        assert r.status_code == 409 and "qwen" in r.json()["reason"]
+        assert client.post("/admin/load", json={"id": "inkling"}).json()["unloaded"] == ["qwen"]
+
+
+def test_a_chat_model_in_any_group_is_listed_and_proxied():
+    raw = raw_registry()
+    raw["models"]["inkling"]["group"] = "assistants"
+    raw["rules"] = [{"group": "video", "requires_online_below": {"group": "assistants", "vram_gb": 20}}]
+    client, _ = make_client(registry=tmp_registry(raw))
+    with client:
+        client.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: streamed({"host": r.url.host})))
+        client.post("/admin/load", json={"id": "inkling"})
+        wait_ready(client, "inkling")
+        assert [m["id"] for m in client.get("/v1/models").json()["data"]] == ["inkling"]
+        assert client.post("/v1/chat/completions", json={"model": "x"}).json() == {"host": "inkling.invalid"}
+
+
+def test_proxy_targets_the_first_online_chat_model_in_registry_order():
+    raw = raw_registry()
+    raw["rules"][0]["max_online"] = 2
+    client, mgr = make_client(registry=tmp_registry(raw))
+    with client:
+        seen = []
+
+        def upstream(request):
+            seen.append((request.url.host, json.loads(request.content)["model"]))
+            return streamed({})
+        client.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        for mid in ("qwen-tiny", "inkling"):
+            client.post("/admin/load", json={"id": mid})
+            wait_ready(client, mid)
+        assert [m["id"] for m in client.get("/v1/models").json()["data"]] == ["inkling", "qwen-tiny"]
+        client.post("/v1/chat/completions", json={"model": "anything"})
+        assert seen == [("inkling.invalid", "upstream-inkling")]
+
+
+def test_video_proxy_targets_the_online_model_that_serves_video():
+    raw = raw_registry()
+    raw["models"]["clip"] = raw["models"].pop("pika")
+    raw["models"]["clip"]["routes"][0]["port"] = 8095
+    client, mgr = make_client(registry=tmp_registry(raw))
+    with client:
+        hosts = []
+
+        def upstream(request):
+            hosts.append(request.url.host)
+            return httpx.Response(200, json={"id": "j1", "state": "queued"})
+        client.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        client.post("/admin/load", json={"id": "clip"})
+        wait_ready(client, "clip")
+        assert client.post("/video/generate", json={"prompt": "x"}).json()["id"] == "j1"
+        assert hosts == ["clip.invalid"] and mgr.backends["clip"].queue_depth == 1
+
+
+def test_503_names_the_capability_and_loading_models():
+    client, mgr = make_client()
+    with client:
+        msg = client.post("/v1/chat/completions", json={}).json()["error"]["message"]
+        assert "chat" in msg and "/load inkling" in msg and "/load qwen-tiny" in msg and "/load pika" not in msg
+        detail = client.post("/video/generate", json={"prompt": "x"}).json()["detail"]
+        assert "video" in detail and "/load pika" in detail and "/load inkling" not in detail

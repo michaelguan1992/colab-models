@@ -24,6 +24,10 @@ HOP_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-e
                "te", "trailer", "upgrade", "proxy-authorization", "authorization", "x-api-key"}
 
 
+CHAT = "chat"
+VIDEO = "video"
+
+
 class LoadReq(BaseModel):
     id: str
     swap: bool = True
@@ -78,6 +82,13 @@ def create_app(manager: Manager, idle_poll_s: float = 30, autoload: str | None =
 
     app = FastAPI(title="lm controller", lifespan=lifespan)
 
+    def unavailable(capability: str) -> str:
+        loading = manager.loading(capability)
+        if loading:
+            return f"{capability} 模型 {loading[0].id} 正在加载中"
+        ids = manager.registry.ids_serving(capability)
+        return f"当前没有在线的 {capability} 模型，请先 {' 或 '.join('/load ' + i for i in ids)}"
+
     # ---- admin -----------------------------------------------------------
     @app.get("/admin/status")
     async def status():
@@ -103,12 +114,12 @@ def create_app(manager: Manager, idle_poll_s: float = 30, autoload: str | None =
     @app.get("/v1/models")
     async def models():
         # No touch(): dsh polls the model list, which must not keep a billed runtime "busy".
-        llm = manager.active_llm()
-        data = []
-        if llm:
-            extras = [b.id for b in manager.backends.values() if b.kind == "video" and b.state == "ready"]
-            name = llm.cfg.get("display", llm.id) + (f" [+{', '.join(extras)}]" if extras else "")
-            data.append({"id": llm.id, "object": "model", "owned_by": "colab", "name": name})
+        chat = manager.serving(CHAT)
+        others = [b.id for b in manager.backends.values() if b.state == "ready" and CHAT not in b.model.serves]
+        suffix = f" [+{', '.join(others)}]" if others else ""
+        data = [{"id": b.id, "object": "model", "owned_by": "colab", "name": b.model.display + suffix,
+                 **({"context_length": b.route.caps["context"]} if "context" in b.route.caps else {})}
+                for b in chat]
         return {"object": "list", "data": data}
 
     @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
@@ -116,14 +127,10 @@ def create_app(manager: Manager, idle_poll_s: float = 30, autoload: str | None =
         inference = request.method != "GET"  # polling GETs must not keep a billed runtime busy
         if inference:
             manager.touch()
-        llm = manager.active_llm()
-        if not llm:
-            loading = [b.id for b in manager.backends.values()
-                       if b.kind == "llm" and b.state not in ("error", "stopped", "stopping")]
-            ids = manager.registry.ids_of_kind("llm")
-            msg = (f"LLM {loading[0]} 正在加载中" if loading
-                   else f"当前没有在线的 LLM，请先 {' 或 '.join('/load ' + i for i in ids)}")
-            return _openai_error(503, msg)
+        ready = manager.serving(CHAT)
+        if not ready:
+            return _openai_error(503, unavailable(CHAT))
+        llm = ready[0]
         body = await request.body()
         if body and llm.upstream_model and request.headers.get("content-type", "").startswith("application/json"):
             with contextlib.suppress(ValueError):
@@ -156,10 +163,10 @@ def create_app(manager: Manager, idle_poll_s: float = 30, autoload: str | None =
     # ---- video -----------------------------------------------------------
     async def _video_forward(request: Request, method: str, path: str, body: bytes | None = None):
         manager.touch()
-        v = manager.active_video()
-        if not v:
-            ids = manager.registry.ids_of_kind("video")
-            raise HTTPException(503, f"视频模型未在线，请先 {' 或 '.join('/load ' + i for i in ids)}")
+        ready = manager.serving(VIDEO)
+        if not ready:
+            raise HTTPException(503, unavailable(VIDEO))
+        v = ready[0]
         client: httpx.AsyncClient = request.app.state.client
         r = await client.request(method, f"{v.base_url}{path}", content=body,
                                  headers={"content-type": "application/json"})

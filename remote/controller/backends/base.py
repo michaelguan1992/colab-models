@@ -5,53 +5,83 @@ import contextlib
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 import httpx
 
 from ..gpu import process_tree
+from ..install import Installed, Installer
 from ..procs import kill_group, pid_alive, port_listening
+from ..registry import Registry
+from ..spec import Engine, ModelSpec, Route, install_needs_model
+from ..templating import engine_values, expand
 
 
 class Backend:
-    """A model process on the runtime. Subclasses implement ``_launch`` and ``_ready``."""
+    """A model process on the runtime. Subclasses implement ``_ready``; the engine config drives the rest."""
 
-    kind = "llm"
+    ready_poll_s = 3.0
 
-    def __init__(self, model_id: str, cfg: dict[str, Any], registry) -> None:
-        self.id = model_id
-        self.cfg = cfg
+    def __init__(self, model: ModelSpec, route: Route, registry: Registry, installer: Installer) -> None:
+        self.id = model.id
+        self.model = model
+        self.route = route
+        self.engine: Engine = registry.engines[route.engine]
         self.registry = registry
-        self.state = "pending"  # pending|downloading|starting|ready|stopping|stopped|error
+        self.installer = installer
+        self.installed: Installed = installer.installed(self.engine) or Installed()
+        self.state = "pending"  # pending|installing|downloading|starting|ready|stopping|stopped|error
         self.error: str | None = None
         self.proc: asyncio.subprocess.Process | None = None
         self.started_at: float | None = None
         self.ready_at: float | None = None
-        self.local_dir: Path = registry.models_dir / model_id
-        self.log_path: Path = registry.logs_dir / f"{model_id}.log"
+        self.local_dir: Path = registry.models_dir / model.id
+        self.lora_dir: Path = registry.models_dir / f"{model.id}-lora"
+        self.log_path: Path = registry.logs_dir / f"{model.id}.log"
         self.upstream_model: str | None = None
         self.health_failures = 0
         self.queue_depth = 0  # running + queued jobs, for backends that serve jobs
         self.recorded_pids: set[int] = set()
         self.on_launch: Callable[[Backend], None] | None = None
-        self._download_pgids: set[int] = set()
+        self._job_pgids: set[int] = set()
 
     @property
     def port(self) -> int:
-        return int(self.cfg["port"])
+        return self.route.port
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def values(self) -> dict[str, str]:
+        r = self.route
+        v = engine_values(self.registry.models_dir, self.registry.outputs_dir, self.port, self.installed.values())
+        v.update(r.params)
+        v["model_dir"] = str(self.local_dir)
+        if r.model_path:
+            v["model_path"] = str(self.local_dir / r.model_path)
+        if r.lora:
+            v.update(lora_dir=str(self.lora_dir), lora_file=r.lora.file)
+        return v
 
     # ---- lifecycle -------------------------------------------------------
     async def start(self) -> None:
         self.started_at = time.time()
         try:
-            if not self.cfg.get("skip_download"):
+            install = self.engine.install
+            install_first = install is not None and not install_needs_model(install)
+            if install_first:
+                await self._install()
+            if self.route.repo:
                 self.state = "downloading"
                 await self.download()
+            if install is not None and not install_first:
+                await self._install()
             self.state = "starting"
             await self._launch()
             if self.on_launch:
                 self.on_launch(self)
-            await self._wait_ready(timeout=float(self.cfg.get("ready_timeout_s", 1800)))
+            await self._wait_ready(timeout=self.route.ready_timeout_s)
             self.state = "ready"
             self.ready_at = time.time()
         except asyncio.CancelledError:
@@ -69,7 +99,7 @@ class Backend:
         self.state = "stopped"
 
     async def _kill(self) -> None:
-        groups = set(self._download_pgids)
+        groups = set(self._job_pgids)
         if self.proc and self.proc.returncode is None:
             groups.add(self.proc.pid)
         await asyncio.gather(*(kill_group(g, grace=30) for g in groups))
@@ -106,15 +136,21 @@ class Backend:
         await self._run_logged(cmd, env=env)
 
     async def download(self) -> None:
-        await self._hf_download(self.cfg["repo"], self.cfg.get("include"), self.local_dir,
-                                self.cfg.get("revision"))
+        r = self.route
+        await self._hf_download(r.repo, list(r.include) or None, self.local_dir, r.revision)
+        if r.lora:
+            await self._hf_download(r.lora.repo, [r.lora.file], self.lora_dir, r.lora.revision)
 
     def download_progress(self) -> float | None:
-        est = self.cfg.get("est_download_gb")
+        est = self.route.est_download_gb
         if not est or not self.local_dir.exists():
             return None
         size = sum(f.stat().st_size for f in self.local_dir.rglob("*") if f.is_file())
-        return min(1.0, size / (float(est) * 1024**3))
+        return min(1.0, size / (est * 1024**3))
+
+    async def _install(self) -> None:
+        self.state = "installing"
+        self.installed = await self.installer.ensure(self.engine, self.local_dir, self._run_logged)
 
     async def _run_logged(self, cmd: list[str], env: dict | None = None) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,13 +159,13 @@ class Backend:
             log.flush()
             p = await asyncio.create_subprocess_exec(
                 *cmd, stdout=log, stderr=log, env=env, start_new_session=True)
-            self._download_pgids.add(p.pid)
+            self._job_pgids.add(p.pid)
             try:
                 rc = await p.wait()
             finally:
                 if p.returncode is None:  # cancelled mid-download: take the whole group down
                     await asyncio.shield(kill_group(p.pid, grace=10))
-                self._download_pgids.discard(p.pid)
+                self._job_pgids.discard(p.pid)
         if rc != 0:
             raise RuntimeError(f"{cmd[0]} 退出码 {rc}，见 {self.log_path}")
 
@@ -156,7 +192,7 @@ class Backend:
                         return
                 except httpx.HTTPError:
                     pass
-                await asyncio.sleep(3)
+                await asyncio.sleep(self.ready_poll_s)
         raise TimeoutError(f"{timeout:.0f}s 内未就绪")
 
     async def check_health(self, client: httpx.AsyncClient) -> bool:
@@ -165,17 +201,14 @@ class Backend:
         except (httpx.HTTPError, RuntimeError, ValueError):
             return False
 
-    async def _launch(self) -> None:  # pragma: no cover - abstract
-        raise NotImplementedError
+    async def _launch(self) -> None:
+        argv = expand(self.engine.launch, self.values(), self.route.extra)
+        await self._spawn(argv, env=self.installed.env(os.environ))
 
     async def _ready(self, client: httpx.AsyncClient) -> bool:  # pragma: no cover - abstract
         raise NotImplementedError
 
     # ---- introspection ---------------------------------------------------
-    @property
-    def base_url(self) -> str:  # pragma: no cover - abstract
-        raise NotImplementedError
-
     def pids(self) -> set[int]:
         if not self.proc or self.proc.returncode is not None:
             return set()
