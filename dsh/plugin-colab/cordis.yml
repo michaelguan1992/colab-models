@@ -1,0 +1,8 @@
+# Overlay for: npx @deepseek-ai/dsh web --patch dsh/plugin-colab/cordis.yml   (or `lm dsh`)
+# Relative names resolve beside this file (per dsh CLI reference; spike: confirm under npx).
+- insert:
+    - id: colab-models
+      name: ./index.ts
+      config:
+        baseURL: http://127.0.0.1:9000
+        lmBin: lm
