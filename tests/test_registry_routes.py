@@ -23,7 +23,7 @@ def two_route_raw():
 
 def test_shipped_registry_parses_into_typed_data():
     reg = Registry(copy.deepcopy(RAW))
-    assert reg.rules == (MaxOnline("llm", 1, True), RequiresBelow("video", "llm", 20.0))
+    assert reg.rules == (MaxOnline("llm", 1, True), RequiresBelow("video", "llm", 22.0))
     assert [type(reg.engines[n].install) for n in ("strata", "llama-cpp", "diffusers")] == \
         [ScriptInstall, ArchiveInstall, VenvInstall]
     assert {m.id: m.group for m in reg.models.values()} == \

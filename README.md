@@ -11,7 +11,7 @@
 
 **调度规则**（写在 `remote/models.yaml` 的 `rules`，由 controller 对"加载之后的在线集合"强制执行，`remote/controller/policy.py`）
 1. 同一时间最多一个 `llm` 组的模型在线（`max_online: 1, on_conflict: swap`）。加载另一个时，会先把同组当前的卸载掉。
-2. 只有在线 `llm` 组模型的**实测**显存低于 20GB 时，`video` 组的 `pika` 才能上线（`requires_online_below`）。所以 Inkling 可以和 Pika 同时在线，Qwen 不行。
+2. 只有在线 `llm` 组模型的**实测**显存低于 22GB 时，`video` 组的 `pika` 才能上线（`requires_online_below`）。所以 Inkling 可以和 Pika 同时在线，Qwen 不行。
 3. 45 分钟没有请求，自动卸载所有模型（`idle_unload_minutes`）。
 
 ## 一次性准备
