@@ -22,7 +22,7 @@ from pathlib import Path
 import httpx
 import yaml
 
-from . import tunnel
+from . import connect, tunnel
 from .colab import Colab, ColabError, eprint
 from .config import CONFIG_PATH, REPO_ROOT, STATE_DIR, Config, load
 from .lock import state_lock
@@ -38,7 +38,7 @@ STATE_ICON = {"ready": "● 在线", "offline": "○ 离线", "installing": "◐
 
 WATCHDOG_POLL_S = 60
 WATCHDOG_WAKE_GAP_S = 3 * WATCHDOG_POLL_S
-LOCKED_COMMANDS = {"up", "down", "load", "unload", "tunnel", "video", "setup-dsh"}
+LOCKED_COMMANDS = {"up", "down", "load", "unload", "tunnel", "video", "connect"}
 
 
 # ---- helpers -------------------------------------------------------------
@@ -407,28 +407,40 @@ def cmd_unload(cfg: Config, a) -> int:
     return 0
 
 
+def _detail(r: httpx.Response) -> str:
+    try:
+        body = r.json()
+    except ValueError:
+        return r.text
+    d = body.get("detail", body) if isinstance(body, dict) else body
+    if isinstance(d, list):  # pydantic validation errors from the worker
+        return "；".join(f"{'.'.join(map(str, e.get('loc', [])[1:]))}: {e.get('msg')}" for e in d)
+    return str(d)
+
+
 def cmd_video(cfg: Config, a) -> int:
     ensure_tunnel(cfg)
-    req = {"prompt": a.prompt, "num_frames": int(a.seconds * 24) + 1, "height": a.height, "width": a.width}
+    inp: dict = {"prompt": a.prompt, "seconds": a.seconds}
+    for k in ("height", "width", "seed"):
+        if getattr(a, k) is not None:
+            inp[k] = getattr(a, k)
     if a.image:
-        req["image_b64"] = base64.b64encode(Path(a.image).read_bytes()).decode()
-    if a.seed is not None:
-        req["seed"] = a.seed
-    r = api(cfg, "POST", "/video/generate", json=req)
+        inp["image_b64"] = base64.b64encode(Path(a.image).expanduser().read_bytes()).decode()
+    r = api(cfg, "POST", "/jobs", json={"model": a.model, "input": inp})
     if r.status_code != 200:
-        print(f"失败：{r.json().get('detail')}")
+        print(f"失败：{_detail(r)}")
         return 1
     job = r.json()
-    print(f"任务 {job['id']} 已提交，生成中 …")
+    print(f"任务 {job['id']}（{job['model']}）已提交，生成中 …")
     while job["state"] in ("queued", "running"):
         time.sleep(3)
-        job = api(cfg, "GET", f"/video/jobs/{job['id']}").json()
+        job = api(cfg, "GET", f"/jobs/{job['id']}").json()
     if job["state"] != "done":
-        print(f"生成失败：{job.get('error')}")
+        print(f"生成失败：{job.get('error') or job.get('detail')}")
         return 1
-    out = Path(a.out or cfg.outputs_dir)
+    out = Path(a.out or cfg.outputs_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
-    dest = out / job["file"]
+    dest = (out / job["file"]).resolve()
     with httpx.stream("GET", f"{cfg.base_url}/files/{job['file']}", timeout=None) as resp:
         resp.raise_for_status()
         with open(dest, "wb") as f:
@@ -451,50 +463,60 @@ def cmd_logs(cfg: Config, a) -> int:
     return 0
 
 
-def cmd_setup_dsh(cfg: Config, a) -> int:
-    """Add a `colab` provider to the dsh profile patch (merging into the existing llm-pi-ai row)."""
-    efforts = {"off": "none", "low": "low", "medium": "medium", "high": "high"}
-    patch = Path(cfg.dsh_home).expanduser() / "profiles" / (a.profile or cfg.dsh_profile) / "cordis.patch.yml"
-    provider = {
-        "api": "openai-completions",
-        "baseURL": f"{cfg.base_url}/v1",
-        # dsh refuses keyless custom routes ("No API key for provider"); the controller ignores it.
-        "apiKeyEnv": "LM_COLAB_API_KEY",
-        # Strata takes OpenAI-style reasoning_effort: none|low|medium|high (docs/DETAILS.md).
-        "compat": {"supportsDeveloperRole": False, "maxTokensField": "max_tokens",
-                   "supportsReasoningEffort": True},
-        # Strata runs Inkling-2-Mini without a thinking mode (inkling_dialect.py: "off / none only"),
-        # so dsh shows no effort selector for it. Qwen keeps the levels (unverified until Qwen runs).
-        "models": [{"id": "inkling", "reasoningEfforts": False},
-                   {"id": "qwen", "reasoningEfforts": dict(efforts)}],
-    }
-    rows = yaml.safe_load(patch.read_text()) if patch.exists() else None
-    rows = rows or []
-    row = next((r for r in rows if isinstance(r, dict) and r.get("id") == "llm-pi-ai"), None)
-    if row is None and not a.force:
-        print(
-            f"{patch} 中还没有 llm-pi-ai 行。dsh 的 patch 会整行替换 config，直接新建可能覆盖内置 provider。\n"
-            "请改用 dsh 界面：Settings → Models → Add model provider → Custom model API\n"
-            f"  Provider ID: colab\n  Base URL:    {cfg.base_url}/v1\n"
-            "  Protocol:    OpenAI Chat Completions\n  API key:     任意非空值（如 local）\n"
-            "  Models:      自动发现（只显示当前在线的模型）\n"
-            "或加 --force 强制写入。"
-        )
-        return 0
-    if row is None:
-        row = {"id": "llm-pi-ai", "config": {"providers": {}}}
-        rows.append(row)
-    row.setdefault("config", {}).setdefault("providers", {})["colab"] = provider
-    if patch.exists():
-        for old in patch.parent.glob(f"{patch.name}.bak-*"):
+def lm_bin() -> str:
+    return shutil.which("lm") or os.path.abspath(sys.argv[0])
+
+
+def _write_with_backup(path: Path, text: str) -> None:
+    if path.exists():
+        for old in path.parent.glob(f"{path.name}.bak-*"):
             old.unlink()
-        backup = patch.with_name(f"{patch.name}.bak-{datetime.now():%Y%m%d%H%M%S}")
-        shutil.copy2(patch, backup)
+        backup = path.with_name(f"{path.name}.bak-{datetime.now():%Y%m%d%H%M%S}")
+        shutil.copy2(path, backup)
         print(f"已备份 {backup}（只保留最近一份）")
-    patch.parent.mkdir(parents=True, exist_ok=True)
-    patch.write_text(yaml.safe_dump(rows, allow_unicode=True, sort_keys=False))
-    print(f"已写入 provider colab → {patch}（dsh 下次请求时自动重载）")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def cmd_connect(cfg: Config, a) -> int:
+    """Write or print a harness's config from the controller's model list (needs `lm up` first)."""
+    ensure_tunnel(cfg)
+    status = api(cfg, "GET", "/admin/status").json()
+    if a.harness == "openai":
+        print(connect.openai_text(status, cfg.base_url))
+        return 0
+    if a.harness == "claude-code":
+        env, mcp = connect.claude_env(status, cfg.base_url, a.model or cfg.default_model, lm_bin())
+        print("# 用 `lm claude` 直接启动；或者把下面这些放进你自己的 shell：")
+        for k, v in env.items():
+            print(f"export {k}={shlex.quote(v)}")
+        print(f"# MCP：claude --mcp-config {shlex.quote(mcp)}")
+        return 0
+    patch = Path(cfg.dsh_home).expanduser() / "profiles" / (a.profile or cfg.dsh_profile) / "cordis.patch.yml"
+    rows = (yaml.safe_load(patch.read_text()) if patch.exists() else None) or []
+    if not any(isinstance(r, dict) and r.get("id") == "llm-pi-ai" for r in rows) and not a.force:
+        print(f"{patch} 中还没有 llm-pi-ai 行。dsh 的 patch 会整行替换 config，直接新建可能覆盖内置 provider。\n"
+              "先在 dsh 界面里随便加一个 Custom model API（Settings → Models），再重跑；或加 --force 强制写入。")
+        return 1
+    provider = connect.dsh_provider(status, cfg.base_url)
+    rows = connect.merge_dsh_patch(rows, provider, connect.mcp_server(lm_bin()))
+    _write_with_backup(patch, yaml.safe_dump(rows, allow_unicode=True, sort_keys=False))
+    ids = ", ".join(f"{m['id']}（上下文 {m.get('contextWindow', '?')}）" for m in provider["models"])
+    print(f"已写入 {patch}：provider colab 的模型 {ids}；MCP server lm。dsh 下次请求时自动重载。")
     return 0
+
+
+def cmd_claude(cfg: Config, a) -> int:
+    ensure_tunnel(cfg)
+    status = api(cfg, "GET", "/admin/status").json()
+    env, mcp = connect.claude_env(status, cfg.base_url, a.model or cfg.default_model, lm_bin())
+    cmd = [cfg.claude_bin, "--mcp-config", mcp, *a.args]
+    return subprocess.call(cmd, env={**os.environ, **env})
+
+
+def cmd_mcp(cfg: Config, a) -> int:
+    from . import mcp_server
+    return mcp_server.run()
 
 
 def cmd_dsh(cfg: Config, a) -> int:
@@ -502,8 +524,7 @@ def cmd_dsh(cfg: Config, a) -> int:
     cmd = ["npx", "-y", "@deepseek-ai/dsh", "web", "--patch", str(plugin_patch)]
     print("启动 dsh：" + " ".join(cmd))
     env = {**os.environ}
-    env.setdefault("LM_COLAB_API_KEY", "local")  # any non-empty value; see cmd_setup_dsh
-    env["LM_BASE_URL"] = cfg.base_url  # read by dsh/plugin-colab as its baseURL default
+    env.setdefault("LM_COLAB_API_KEY", "local")  # any non-empty value; see connect.dsh_provider
     return subprocess.call(cmd, env=env)
 
 
@@ -539,12 +560,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("model", nargs="?")
     s.set_defaults(fn=cmd_unload)
 
-    s = sub.add_parser("video", help="用 Pika 生成视频并下载到本地")
+    s = sub.add_parser("video", help="用视频模型（Pika）生成视频并下载到本地")
     s.add_argument("prompt")
     s.add_argument("--image", help="首帧图片")
-    s.add_argument("--seconds", type=float, default=5)
-    s.add_argument("--height", type=int, default=480)
-    s.add_argument("--width", type=int, default=832)
+    s.add_argument("--seconds", type=float, default=5, help="5 到 15 秒")
+    s.add_argument("--height", type=int, help="默认由模型决定")
+    s.add_argument("--width", type=int, help="默认由模型决定")
+    s.add_argument("--model", help="任务模型 id；只有一个在线时可省略")
     s.add_argument("--seed", type=int)
     s.add_argument("--out")
     s.set_defaults(fn=cmd_video)
@@ -557,10 +579,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-n", "--lines", type=int, default=80)
     s.set_defaults(fn=cmd_logs)
 
-    s = sub.add_parser("setup-dsh", help="把 colab provider 写入 dsh profile")
-    s.add_argument("--profile")
-    s.add_argument("--force", action="store_true")
-    s.set_defaults(fn=cmd_setup_dsh)
+    s = sub.add_parser("connect", help="按 controller 的模型列表生成 harness 配置（dsh / claude-code / openai）")
+    s.add_argument("harness", choices=["dsh", "claude-code", "openai"])
+    s.add_argument("--model", help="claude-code 用哪个模型（默认 default_model）")
+    s.add_argument("--profile", help="dsh profile（默认 dsh_profile）")
+    s.add_argument("--force", action="store_true", help="dsh：patch 里没有 llm-pi-ai 行也写入")
+    s.set_defaults(fn=cmd_connect)
+
+    s = sub.add_parser("claude", help="用 Colab 上的模型启动 Claude Code（带 lm 的 MCP 工具）")
+    s.add_argument("--model", help="默认 default_model")
+    s.set_defaults(fn=cmd_claude)  # every other argument is passed to claude unchanged
+
+    s = sub.add_parser("mcp", help="以 stdio MCP server 运行（给 harness 调用）")
+    s.set_defaults(fn=cmd_mcp)
 
     s = sub.add_parser("dsh", help="带 colab 插件启动 dsh web")
     s.set_defaults(fn=cmd_dsh)
@@ -571,7 +602,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    a = build_parser().parse_args(argv)
+    parser = build_parser()
+    a, rest = parser.parse_known_args(argv)
+    if a.cmd == "claude":
+        a.args = rest
+    elif rest:
+        parser.error(f"unrecognized arguments: {' '.join(rest)}")
     cfg = load()
     try:
         if a.cmd in LOCKED_COMMANDS:

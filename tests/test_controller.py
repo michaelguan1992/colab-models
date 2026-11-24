@@ -13,7 +13,7 @@ def test_models_empty_and_proxy_503():
     client, _ = make_client()
     with client:
         assert client.get("/v1/models").json()["data"] == []
-        r = client.post("/v1/chat/completions", json={"model": "x", "messages": []})
+        r = client.post("/v1/chat/completions", json={"messages": []})
         assert r.status_code == 503
         assert "没有在线" in r.json()["error"]["message"]
 
@@ -60,10 +60,13 @@ def test_unknown_model_404_and_unload_all():
         assert client.get("/admin/status").json()["online"] == []
 
 
-def test_video_requires_pika():
+def test_jobs_require_a_jobs_model_online():
     client, _ = make_client()
     with client:
-        assert client.post("/video/generate", json={"prompt": "a cat"}).status_code == 503
+        assert client.post("/jobs", json={"input": {"prompt": "a cat"}}).status_code == 503
+        assert client.post("/jobs", json={"model": "pika", "input": {}}).status_code == 503
+        assert client.post("/jobs", json={"model": "nope", "input": {}}).status_code == 404
+        assert client.get("/jobs/unknown").status_code == 404
 
 
 def test_idle_unload():
@@ -260,10 +263,10 @@ def test_a_chat_model_in_any_group_is_listed_and_proxied():
         client.post("/admin/load", json={"id": "inkling"})
         wait_ready(client, "inkling")
         assert [m["id"] for m in client.get("/v1/models").json()["data"]] == ["inkling"]
-        assert client.post("/v1/chat/completions", json={"model": "x"}).json() == {"host": "inkling.invalid"}
+        assert client.post("/v1/chat/completions", json={"model": "inkling"}).json() == {"host": "inkling.invalid"}
 
 
-def test_proxy_targets_the_first_online_chat_model_in_registry_order():
+def test_proxy_routes_by_the_requested_model_and_never_substitutes():
     raw = raw_registry()
     raw["rules"][0]["max_online"] = 2
     client, mgr = make_client(registry=tmp_registry(raw))
@@ -278,11 +281,22 @@ def test_proxy_targets_the_first_online_chat_model_in_registry_order():
             client.post("/admin/load", json={"id": mid})
             wait_ready(client, mid)
         assert [m["id"] for m in client.get("/v1/models").json()["data"]] == ["inkling", "qwen-tiny"]
-        client.post("/v1/chat/completions", json={"model": "anything"})
-        assert seen == [("inkling.invalid", "upstream-inkling")]
+        client.post("/v1/chat/completions", json={"model": "qwen-tiny"})
+        client.post("/v1/chat/completions", json={"model": "inkling"})
+        assert seen == [("qwen-tiny.invalid", "upstream-qwen-tiny"), ("inkling.invalid", "upstream-inkling")]
+        r = client.post("/v1/chat/completions", json={"model": "anything"})
+        assert r.status_code == 404 and "inkling" in r.json()["error"]["message"]
+        r = client.post("/v1/chat/completions", json={"model": "qwen"})
+        assert r.status_code == 404 and "/load qwen" in r.json()["error"]["message"]
+        r = client.post("/v1/chat/completions", json={"messages": []})
+        assert r.status_code == 400 and "qwen-tiny" in r.json()["error"]["message"]
+        assert len(seen) == 2
+        client.post("/admin/unload", json={"id": "qwen-tiny"})
+        client.post("/v1/chat/completions", json={"messages": []})
+        assert seen[-1] == ("inkling.invalid", "upstream-inkling"), "a lone online model fills in the missing id"
 
 
-def test_video_proxy_targets_the_online_model_that_serves_video():
+def test_jobs_route_to_the_online_jobs_model_and_remember_the_owner():
     raw = raw_registry()
     raw["models"]["clip"] = raw["models"].pop("pika")
     raw["models"]["clip"]["routes"][0]["port"] = 8095
@@ -291,13 +305,17 @@ def test_video_proxy_targets_the_online_model_that_serves_video():
         hosts = []
 
         def upstream(request):
-            hosts.append(request.url.host)
+            hosts.append((request.url.host, request.url.path, request.content))
             return httpx.Response(200, json={"id": "j1", "state": "queued"})
         client.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
         client.post("/admin/load", json={"id": "clip"})
         wait_ready(client, "clip")
-        assert client.post("/video/generate", json={"prompt": "x"}).json()["id"] == "j1"
-        assert hosts == ["clip.invalid"] and mgr.backends["clip"].queue_depth == 1
+        job = client.post("/jobs", json={"input": {"prompt": "x", "seconds": 6}}).json()
+        assert job == {"id": "j1", "state": "queued", "model": "clip"}
+        assert client.get("/jobs/j1").json()["model"] == "clip"
+        assert hosts == [("clip.invalid", "/generate", b'{"prompt": "x", "seconds": 6}'),
+                         ("clip.invalid", "/jobs/j1", b"")]
+        assert mgr.backends["clip"].queue_depth == 1
 
 
 def test_503_names_the_capability_and_loading_models():
@@ -305,5 +323,5 @@ def test_503_names_the_capability_and_loading_models():
     with client:
         msg = client.post("/v1/chat/completions", json={}).json()["error"]["message"]
         assert "chat" in msg and "/load inkling" in msg and "/load qwen-tiny" in msg and "/load pika" not in msg
-        detail = client.post("/video/generate", json={"prompt": "x"}).json()["detail"]
-        assert "video" in detail and "/load pika" in detail and "/load inkling" not in detail
+        detail = client.post("/jobs", json={"input": {"prompt": "x"}}).json()["detail"]
+        assert "/load pika" in detail and "/load inkling" not in detail

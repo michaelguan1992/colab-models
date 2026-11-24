@@ -36,20 +36,8 @@ def test_logs_follow_remote_dir(monkeypatch):
     assert cmds == ["tail -n 5 /data/lm/logs/inkling.log"]
 
 
-def test_setup_dsh_keeps_only_latest_backup(tmp_path):
-    cfg = Config(dsh_home=str(tmp_path))
-    patch = tmp_path / "profiles" / "web" / "cordis.patch.yml"
-    patch.parent.mkdir(parents=True)
-    patch.write_text(yaml.safe_dump([{"id": "llm-pi-ai", "config": {"providers": {}}}]))
-    for ts in ("20200101000000", "20200102000000"):
-        (patch.parent / f"cordis.patch.yml.bak-{ts}").write_text("old")
-    assert cli.cmd_setup_dsh(cfg, A(profile=None, force=False)) == 0
-    backups = list(patch.parent.glob("cordis.patch.yml.bak-*"))
-    assert len(backups) == 1 and "2020" not in backups[0].name
-
-
-def test_dsh_gets_configured_port(monkeypatch):
+def test_dsh_launch_carries_the_placeholder_key_and_the_plugin(monkeypatch):
     seen = {}
-    monkeypatch.setattr(cli.subprocess, "call", lambda cmd, env: seen.update(env=env) or 0)
-    cli.cmd_dsh(Config(local_port=9123), A())
-    assert seen["env"]["LM_BASE_URL"] == "http://127.0.0.1:9123"
+    monkeypatch.setattr(cli.subprocess, "call", lambda cmd, env: seen.update(cmd=cmd, env=env) or 0)
+    cli.cmd_dsh(Config(), A())
+    assert seen["env"]["LM_COLAB_API_KEY"] and seen["cmd"][-1].endswith("plugin-colab/cordis.yml")

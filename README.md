@@ -21,9 +21,10 @@ uv tool install google-colab-cli      # 然后按提示在浏览器里授权
 ```bash
 uv tool install -e .                  # 在本仓库里执行，安装 lm 命令
 ```
-在 dsh 里添加 provider（任选一种）：
-- 界面操作：Settings → Models → Add model provider → Custom model API。Provider ID 填 `colab`，Base URL 填 `http://127.0.0.1:9000/v1`，协议选 OpenAI Chat Completions，key 随便填。
-- 或者运行 `lm setup-dsh`：合并写入 `~/.dsh/profiles/web/cordis.patch.yml`，写之前会先备份。
+接入 harness。先运行 `lm up`，配置会按 controller 报告的模型和能力生成，不在 Mac 上手写：
+- dsh：`lm connect dsh`。它合并写入 `~/.dsh/profiles/web/cordis.patch.yml` 两样东西。一是 provider `colab`，模型、上下文、思考档位、能否看图都来自 `caps`。二是 MCP server `lm`。写之前会备份，只留最近一份。换了 GPU 或改了 `models.yaml` 之后重跑一次。
+- Claude Code：`lm claude`，其余参数原样传给 `claude`，如 `lm claude -p "hi"`。它把 `ANTHROPIC_BASE_URL` 指向 controller，把所有模型别名指向 `default_model`，按 caps 设置上下文窗口，并用 `--mcp-config` 挂上 `lm mcp`。它不改你的 Claude Code 全局设置。`claude` 不在 PATH 上时，在配置里设 `claude_bin`。`lm connect claude-code` 只打印这些环境变量。
+- 其他 OpenAI 客户端（Open WebUI、Continue、Cursor 等）：`lm connect openai` 打印 Base URL 和模型 id。
 
 第一次在真实 G4 上运行时，按 [docs/spike.md](docs/spike.md) 逐项核对。
 
@@ -57,21 +58,26 @@ idle_stop_minutes = 60
 default_model = "inkling"
 ```
 
-其他命令：`lm status [--usage]`、`lm load <id>`、`lm unload [id]`、`lm video "提示词" [--image 首帧.png]`、`lm tunnel`、`lm logs [controller|inkling|qwen|pika]`、`lm dsh`。
+其他命令：`lm status [--usage]`、`lm load <id>`、`lm unload [id]`、`lm video "提示词" [--seconds 5到15] [--image 首帧.png]`、`lm tunnel`、`lm logs [controller|inkling|qwen|pika]`、`lm dsh`、`lm mcp`。
+
+### 请求怎么路由
+- 请求里的 `model` 是哪个在线模型的 id，就发给哪个。模型不在线或不存在时返回 404 并列出在线的模型，不会悄悄换成别的模型。只有一个聊天模型在线时，`model` 可以留空或写 `default`。
+- `/v1/messages`（Anthropic 协议）直通给声明了 `anthropic` 的引擎（Basalt、Strata）。llama.cpp 这类引擎会返回明确的错误。
+- 视频这类任务走 `POST /jobs {"model": "pika", "input": {"prompt": "...", "seconds": 5}}`，用 `GET /jobs/{id}` 查状态，结果在 `/files/`。帧数由 worker 按自己的 fps 计算，5 到 15 秒以外的时长会被拒绝。
+
+### 给模型用的工具（MCP）
+`lm mcp` 是一个 stdio MCP server，工具有 `status`、`load`、`unload`、`up`、`down`、`generate`。每个工具运行的就是对应的 `lm` 命令。`lm connect dsh` 和 `lm claude` 会自动挂上它。其他支持 MCP 的 harness 把命令配成 `lm mcp` 即可。`generate` 要等视频生成完，所以 dsh 那边的工具超时设成了 30 分钟。
 
 ### 在 dsh 里使用
-`lm dsh` 会带上 `dsh/plugin-colab` 插件启动 dsh web。插件提供：
-- 斜杠命令：`/up [model]`、`/down`、`/load <id>`、`/unload [id]`、`/status`
-- 给模型调用的工具：`colab_status`、`generate_video`（生成的 mp4 保存到 `./outputs/`）
-- 在线状态的显示：dsh 的模型选择器通过 `/v1/models` 发现模型，而这个接口**只列出在线且 `serves: [chat]` 的模型**（带 `context_length`）；如果别的模型（如 Pika）也在线，名字后面会带 `[+pika]`。完整状态（下载进度、显存）用 `/status` 查看。
+`lm dsh` 会带上 `dsh/plugin-colab` 插件启动 dsh web。插件只提供斜杠命令 `/up [model]`、`/down`、`/load <id>`、`/unload [id]`、`/status`，每个都直接运行 `lm`。dsh 的模型选择器通过 `/v1/models` 发现模型，这个接口**只列出在线且 `serves: [chat]` 的模型**。如果别的模型（如 Pika）也在线，名字后面会带 `[+pika]`。
 
 ## 结构
 ```
 src/lm/                Mac 端 CLI（colab CLI 封装、ssh 隧道、命令）
 remote/bootstrap.sh    在 Colab 上安装 controller 依赖并启动它（可重复执行）；引擎在第一次加载用到它的模型时才安装
 remote/models.yaml     注册表：engines（怎么装、怎么起）、models（仓库、路线、caps、显存估计）、rules（调度规则）。加模型或引擎只改它
-remote/controller/     FastAPI :9000 —— /v1 反向代理、/admin、/video、调度规则
-dsh/plugin-colab/      dsh 插件（斜杠命令 + 工具）
+remote/controller/     FastAPI :9000 —— /v1 按 model 路由的反向代理、/jobs、/admin、调度规则
+dsh/plugin-colab/      dsh 插件（斜杠命令，调用 lm）
 ```
 Mac 和 Colab 之间只走 `ssh -L`（以 `colab ssh --proxy-mode` 作为 ProxyCommand），没有公网入口。
 

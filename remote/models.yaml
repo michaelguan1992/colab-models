@@ -90,7 +90,7 @@ models:
   inkling:
     group: llm
     serves: [chat]
-    display: Inkling-2-Mini Uncensored (Q4_K)
+    display: Inkling-2-Mini Uncensored
     caps: {tools: true, vision: false, context: 32768, reasoning: []}
     routes:
       # Basalt reads only its own .basalt packs and converts Inkling from safetensors, not GGUF, so this route

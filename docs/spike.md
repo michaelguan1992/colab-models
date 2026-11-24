@@ -137,3 +137,15 @@ colab ssh -s localmodels -- bash -lc 'python3 -m venv /content/fv && /content/fv
 - 工具调用、看图都正常。Basalt 下 Inkling 默认开思考，`reasoning_effort` 有效（none / low / high 的思考量逐级增加）。
 - 私有仓库 `mgresearch/colab-models-basalt`（commit `4c0f85f3`）存放转换好的 `Inkling-2-Mini-Uncensored-OU.basalt`（19.6GB）。HF_TOKEN 经 ssh stdin 送到运行时（ControlMaster 路径，37 字节，权限 600）。从仓库下载约 1 分钟，启动约 10 秒，端到端约 248 tok/s。
 - 上下文：模型原生 1M（`model_max_length` 1048576；24 层里 20 层是 1024 窗口的滑动注意力，只有 4 层全局）。`--max-context` 32K 时 19.9GB，64K 时 20.9GB，1M 时 54.7GB。1M 下 239K token 的提示 26.6 秒读完，能找回开头埋的口令。代价是 G4 上 Pika 不能再和 Inkling 同时在线。
+
+## 9. 第 4 阶段（G4，2026-11-23）
+
+- 按 `model` 路由：`inkling` 正常。`gpt-4o` 返回 404"没有叫 gpt-4o 的模型（在线的聊天模型：inkling）"。离线的 `qwen` 返回 404 并提示 `/load qwen`。不带 `model` 时路由到唯一在线的 Inkling，并补上 Basalt 自己的模型名。第一次部署漏了补名这一步，Basalt 回了 "model is required"，已修。
+- `/v1/messages` 直通 Basalt：工具调用返回 `tool_use get_weather {"city": "Paris"}`。流式 SSE 正常，先是 thinking 块，再是 text。
+- `/jobs`：没有任务模型在线时返回 503 并提示 `/load pika`。卸载 Inkling、单独加载 Pika 后：
+  - 经 MCP 工具 `generate`（MCP 客户端走 stdio 调 `lm mcp`）生成 5 秒视频：432 秒，是加载后的第一次请求，权重懒加载。得到 H.264 832×480，5.17 秒，带 AAC 音轨。
+  - 再用 `lm video --seconds 6` 生成：92 秒。
+  - 3 秒和 20 秒被 worker 拒绝。原因要用 MCP 的 `ToolError` 抛出才能传给模型，否则客户端只看到 "Error executing tool generate"，已修。
+  - 没能让 LLM 在 harness 里调用 `generate`：G4 上 Inkling（1M 上下文）和 Pika 放不下，而能和 Pika 共存的 qwen-tiny 只有 8K 上下文，装不下 dsh 或 Claude Code 的系统提示。工具本身和 harness 的接线都已分别验证。
+- Claude Code 2.1.330（`lm claude -p`）：经 Inkling 回答正常，调用 MCP 工具 `mcp__lm__status` 也正常。自定义模型 id 要设 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`，否则它按 1M 估算并打警告。`lm claude` 现在按 caps 设置这个值。
+- dsh：`lm connect dsh` 写入后，正在运行的 dsh 热加载了 provider 和 MCP server。新会话里能看到 `mcp__lm__status` 等 6 个工具，并成功调用。MCP 管理器在 patch 里的行 id 是 `mcp-manager`，不是它 README 示例里的 `mcp`。dsh 的 MCP 工具默认超时 60 秒，不够 `generate` 用，所以写入了 `toolCallTimeoutMs: 1800000`。

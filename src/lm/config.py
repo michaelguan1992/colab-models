@@ -34,6 +34,7 @@ class Config:
     remote_src: str = str(REPO_ROOT / "remote")
     dsh_home: str = os.environ.get("DSH_HOME", "~/.dsh")
     dsh_profile: str = "web"
+    claude_bin: str = "claude"
     outputs_dir: str = "outputs"
     hf_token_env: str = "HF_TOKEN"     # Mac env var whose value deploy copies to the runtime's HF token file
 

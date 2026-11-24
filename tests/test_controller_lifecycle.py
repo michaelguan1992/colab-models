@@ -103,7 +103,7 @@ def test_503_texts_list_registry_ids():
     with client:
         llm = client.post("/v1/chat/completions", json={}).json()["error"]["message"]
         assert "/load alpha" in llm and "inkling" not in llm and "qwen" not in llm
-        video = client.post("/video/generate", json={"prompt": "x"})
+        video = client.post("/jobs", json={"input": {"prompt": "x"}})
         assert video.status_code == 503 and "/load clip" in video.json()["detail"]
 
 
@@ -381,19 +381,19 @@ def test_only_inference_posts_count_as_activity_through_the_proxy():
         assert client.get("/v1/models").status_code == 200
         assert client.get("/v1/something").json() == {"path": "/v1/something"}
         assert client.get("/admin/status").json()["idle_seconds"] >= 999
-        assert client.post("/v1/chat/completions", json={"model": "x"}).status_code == 200
+        assert client.post("/v1/chat/completions", json={"model": "inkling"}).status_code == 200
         s = client.get("/admin/status").json()
         assert s["idle_seconds"] < 5 and s["inflight"]["requests"] == 0
 
 
-def test_video_job_calls_count_as_activity():
+def test_job_calls_count_as_activity():
     client, mgr, upstream = proxy_client()
     with client:
         client.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
         client.post("/admin/load", json={"id": "pika"})
         wait_ready(client, "pika")
         mgr.last_activity -= 1000
-        client.get("/video/jobs/abc")
+        client.get("/jobs/abc")
         assert client.get("/admin/status").json()["idle_seconds"] < 5
 
 

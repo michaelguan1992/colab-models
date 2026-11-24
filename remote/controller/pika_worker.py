@@ -19,7 +19,7 @@ from queue import Queue
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class GenReq(BaseModel):
@@ -27,7 +27,7 @@ class GenReq(BaseModel):
     image_b64: str | None = None      # optional first frame (PNG/JPEG, base64)
     height: int | None = None         # None = the worker's --height
     width: int | None = None          # None = the worker's --width
-    num_frames: int = 121             # ~5 s at 24 fps
+    seconds: float = Field(5, ge=5, le=15)  # Pika-H3-Flex only accepts 5-15 s clips
     steps: int | None = None
     seed: int | None = None
 
@@ -81,7 +81,7 @@ class Worker:
         from diffusers.utils.export_utils import encode_video
 
         kwargs = dict(prompt=req.prompt, height=req.height or self.args.height, width=req.width or self.args.width,
-                      num_frames=req.num_frames,
+                      num_frames=round(req.seconds * self.args.fps) + 1,
                       num_inference_steps=req.steps or self.args.steps, guidance_scale=self.args.guidance,
                       output=["videos", "audio", "sampling_rate"])
         if req.image_b64:

@@ -51,7 +51,7 @@ def test_concurrent_acquisitions_serialize(capsys):
 
 
 @pytest.mark.parametrize("cmd,locked", [("unload", True), ("down", True), ("load", True), ("up", True),
-                                        ("tunnel", True), ("video", True), ("setup-dsh", True),
+                                        ("tunnel", True), ("video", True), ("connect", True),
                                         ("status", False), ("logs", False)])
 def test_main_locks_state_changing_commands(monkeypatch, cmd, locked):
     seen = []
@@ -62,8 +62,8 @@ def test_main_locks_state_changing_commands(monkeypatch, cmd, locked):
         return 0
 
     monkeypatch.setattr(cli, "load", lambda: Config())
-    for name in ("up", "down", "load", "unload", "tunnel", "video", "setup_dsh", "status", "logs"):
+    for name in ("up", "down", "load", "unload", "tunnel", "video", "connect", "status", "logs"):
         monkeypatch.setattr(cli, f"cmd_{name}", probe)
-    argv = {"load": ["load", "m"], "video": ["video", "p"]}.get(cmd, [cmd])
+    argv = {"load": ["load", "m"], "video": ["video", "p"], "connect": ["connect", "dsh"]}.get(cmd, [cmd])
     assert cli.main(argv) == 0
     assert seen == [not locked]
