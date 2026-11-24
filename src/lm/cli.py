@@ -76,6 +76,8 @@ def print_status(s: dict, cfg: Config) -> None:
         print(f"{m['id']:<10}{state:<14}{vram:>8}   {note}")
     idle_min = s["idle_seconds"] / 60
     print(f"空闲 {idle_min:.0f} 分钟（{s['idle_unload_minutes']:.0f} 分钟后自动卸载模型）")
+    if s.get("external_work"):
+        print(f"外部任务算作活动：{'、'.join(s['external_work'])}")
 
 
 def wait_model(cfg: Config, model_id: str, timeout: float = 3600) -> bool:

@@ -231,3 +231,31 @@ def test_basalt_counts_as_ready_only_once_its_model_reports_loaded():
             assert await b._ready(client)
             assert b.upstream_model == "Inkling-OU"
     asyncio.run(go())
+
+
+def test_failed_download_retries_with_fewer_connections(monkeypatch):
+    calls = []
+
+    async def flaky(self, cmd, env=None):
+        calls.append(env.get("HF_XET_HIGH_PERFORMANCE") or env.get("HF_XET_FIXED_DOWNLOAD_CONCURRENCY"))
+        if len(calls) < 3:
+            raise RuntimeError("hf 退出码 1")
+
+    from controller.backends.base import Backend
+    monkeypatch.setattr(Backend, "_run_logged", flaky)
+    b = build(ServerBackend, "qwen-tiny", tmp_registry())
+    b.download_retry_s = 0
+    asyncio.run(b.download())
+    assert calls == ["1", "4", "4"]  # high-performance first, then 4 fixed connections
+
+
+def test_download_gives_up_after_the_last_attempt(monkeypatch):
+    async def broken(self, cmd, env=None):
+        raise RuntimeError("hf 退出码 1")
+
+    from controller.backends.base import Backend
+    monkeypatch.setattr(Backend, "_run_logged", broken)
+    b = build(ServerBackend, "qwen-tiny", tmp_registry())
+    b.download_retry_s = 0
+    with pytest.raises(RuntimeError):
+        asyncio.run(b.download())

@@ -21,6 +21,8 @@ class Backend:
     """A model process on the runtime. Subclasses implement ``_ready``; the engine config drives the rest."""
 
     ready_poll_s = 3.0
+    download_attempts = 4
+    download_retry_s = 60.0
 
     def __init__(self, model: ModelSpec, route: Route, registry: Registry, installer: Installer) -> None:
         self.id = model.id
@@ -132,8 +134,20 @@ class Backend:
             cmd += ["--revision", revision]
         for pat in include or []:
             cmd += ["--include", pat]
-        env = {**os.environ, "HF_XET_HIGH_PERFORMANCE": "1"}  # hf_transfer is gone in huggingface_hub 1.x
-        await self._run_logged(cmd, env=env)
+        # High-performance Xet (hf_transfer's successor) is fastest, but on the 80GB private Qwen pack the HF CDN
+        # answered 429 every time, at both high and default concurrency, and the partial file was discarded.
+        # What got it through: 4 fixed connections and Xet's own retries, so later attempts use that.
+        for attempt in range(self.download_attempts):
+            env = {**os.environ, "HF_XET_HIGH_PERFORMANCE": "1"} if attempt == 0 else {
+                **os.environ, "HF_XET_FIXED_DOWNLOAD_CONCURRENCY": "4", "HF_XET_CLIENT_RETRY_MAX_ATTEMPTS": "30",
+                "HF_XET_CLIENT_ENABLE_ADAPTIVE_CONCURRENCY": "false"}
+            try:
+                await self._run_logged(cmd, env=env)
+                return
+            except RuntimeError:
+                if attempt == self.download_attempts - 1:
+                    raise
+                await asyncio.sleep(self.download_retry_s * (attempt + 1))
 
     async def download(self) -> None:
         r = self.route

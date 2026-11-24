@@ -13,6 +13,7 @@
 1. 同一时间最多一个 `llm` 组的模型在线（`max_online: 1, on_conflict: swap`）。加载另一个时，会先把同组当前的卸载掉。
 2. 只有在线 `llm` 组模型的**实测**显存低于 22GB 时，`video` 组的 `pika` 才能上线（`requires_online_below`）。在 G4 上 Inkling 走 Basalt、开 1M 上下文，实测 54.7GB，所以 Pika 只能单独在线（演示用的 qwen-tiny 除外）。
 3. 45 分钟没有请求，自动卸载所有模型（`idle_unload_minutes`）。
+   在运行时上手动跑的任务也算活动，不会被当成空闲：GPU 上有不属于任何已加载模型的进程，或 `/content/lm/holds/` 里有文件（给转换、下载这类不用 GPU 的任务用，跑完删掉）。`lm status` 会列出这些外部任务。
 
 ## 一次性准备
 ```bash

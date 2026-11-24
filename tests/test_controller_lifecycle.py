@@ -12,6 +12,7 @@ from controller.backends.jobs import JobsBackend
 from controller.backends.server import ServerBackend
 from controller.cleanup import SystemReaper, reap_stale
 from controller.hf import classify_hf_error, hf_preflight
+from controller.gpu import GpuSnapshot
 from controller.state import StateFile
 from ctl_helpers import (REGISTRY_YAML, FakeBackend, FakeReaper, build, make_client, make_manager,
                          offline_installer, tmp_registry, wait_ready)
@@ -327,6 +328,34 @@ def test_idle_unload_waits_for_video_jobs():
     asyncio.run(run())
 
 
+def test_external_gpu_process_or_hold_file_counts_as_activity():
+    snap = {"per_pid": {}}
+    mgr = make_manager(factory=FakeBackend)
+    mgr.probe = lambda: GpuSnapshot("RTX PRO 6000", 0, 96, dict(snap["per_pid"]), True, "")
+
+    async def run():
+        await mgr.load("inkling")
+        await asyncio.sleep(0)
+        snap["per_pid"] = {4242: 30.0}
+        expire(mgr)
+        await mgr.idle_check()
+        assert "inkling" in mgr.backends and mgr.status()["idle_seconds"] < 5
+        assert mgr.status()["external_work"] == ["GPU 进程 4242"]
+
+        snap["per_pid"] = {}
+        mgr.registry.holds_dir.mkdir(parents=True)
+        (mgr.registry.holds_dir / "qwen-convert").touch()
+        expire(mgr)
+        await mgr.idle_check()
+        assert "inkling" in mgr.backends and mgr.status()["external_work"] == ["hold qwen-convert"]
+
+        (mgr.registry.holds_dir / "qwen-convert").unlink()
+        expire(mgr)
+        await mgr.idle_check()
+        assert mgr.backends == {}
+    asyncio.run(run())
+
+
 def test_status_reports_busy_and_inflight():
     client, mgr = make_client()
     with client:
@@ -517,3 +546,20 @@ def test_hf_preflight_lets_network_errors_through(monkeypatch, caplog):
     assert "org/model" in caplog.text
     resp = types.SimpleNamespace(status_code=503)
     assert classify_hf_error("o/m", type("HfHubHTTPError", (Exception,), {"response": resp})()) is None
+
+
+def test_loading_another_route_of_an_online_model_switches_routes():
+    from test_registry_routes import two_route_raw
+    mgr = make_manager(registry=tmp_registry(two_route_raw()), compute_cap="12.0")
+
+    async def run():
+        await mgr.load("inkling")
+        await asyncio.sleep(0)
+        first = mgr.backends["inkling"]
+        assert first.route.name == "fast"
+        same = await mgr.load("inkling", route="fast")
+        assert same.ok and "已在线" in same.reason and mgr.backends["inkling"] is first
+        switched = await mgr.load("inkling", route="strata")
+        await asyncio.sleep(0)
+        assert switched.ok and mgr.backends["inkling"].route.name == "strata" and first.state == "stopped"
+    asyncio.run(run())

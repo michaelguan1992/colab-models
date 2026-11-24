@@ -151,12 +151,19 @@ class Manager:
         self.registry.model(model_id)
         async with self.lock:
             existing = self.backends.get(model_id)
-            if existing and existing.state not in ("stopped", "error"):
+            online = existing is not None and existing.state not in ("stopped", "error")
+            if online and route in (None, existing.route.name):
                 return Plan(True, reason=f"{model_id} 已在线")
             snap = self.probe()
             choice = self.registry.choose(model_id, snap.compute_cap, route)
             if choice.route is None:
                 return self._refuse(model_id, choice.reason)
+            if online:  # another route of the same model: take this one down before planning the new one
+                b = await self._stop_entry(model_id)
+                if b is not None and not await self._released(b):
+                    return self._refuse(model_id, f"{model_id} 的 {existing.route.name} 路线已停止但资源未释放：{b.error}")
+                existing = None
+                snap = self.probe()
             model, route = self.registry.model(model_id), choice.route
 
             why = await self._hf_refusal(route)
@@ -327,7 +334,25 @@ class Manager:
                         b.error = "引擎无响应/已退出"
                         self._log(f"{b.id} {b.error}")
 
+    def external_work(self) -> list[str]:
+        """Work started outside the controller that must keep the runtime alive.
+
+        A benchmark or conversion run over ssh sends no requests, so without this the idle
+        timers (here and in the Mac watchdog) stop a runtime that is busy. Two signals: a GPU
+        process no backend owns, and any file in holds_dir (for CPU or network work).
+        """
+        ours: set[int] = set()
+        for b in self.backends.values():
+            ours |= b.pids()
+        reasons = [f"GPU 进程 {pid}" for pid in sorted(set(self.probe().per_pid_gb) - ours)]
+        if self.registry.holds_dir.is_dir():
+            reasons += [f"hold {p.name}" for p in sorted(self.registry.holds_dir.iterdir())]
+        return reasons
+
     async def idle_check(self) -> None:
+        if self.external_work():
+            self.touch()
+            return
         limit = self.registry.idle_unload_minutes * 60
         if limit <= 0 or not self.backends or self.busy() or time.time() - self.last_activity <= limit:
             return
@@ -371,6 +396,7 @@ class Manager:
             "idle_unload_minutes": self.registry.idle_unload_minutes,
             "idle_unloaded": self.idle_unloaded,
             "busy": self.busy(),
+            "external_work": self.external_work(),
             "inflight": self.inflight(),
             "events": self.events[-10:],
         }

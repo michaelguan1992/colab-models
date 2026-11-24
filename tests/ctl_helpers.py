@@ -76,7 +76,8 @@ def tmp_registry(raw=None):
     root = Path(tempfile.mkdtemp(prefix="lm-test-"))
     raw["paths"] = {"models_dir": str(root / "models"), "outputs_dir": str(root / "out"),
                     "logs_dir": str(root / "logs"), "state_file": str(root / "state.json"),
-                    "engines_dir": str(root / "engines"), "venvs_dir": str(root / "venvs")}
+                    "engines_dir": str(root / "engines"), "venvs_dir": str(root / "venvs"),
+                    "holds_dir": str(root / "holds")}
     return Registry(raw)
 
 

@@ -20,7 +20,7 @@ APIS = ("openai", "anthropic")
 SHA256 = re.compile(r"[0-9a-fA-F]{64}")
 
 TOP_KEYS = {"paths", "idle_unload_minutes", "vram_margin_gb", "disk_reserve_gb", "engines", "models", "rules"}
-PATH_KEYS = {"models_dir", "outputs_dir", "logs_dir", "state_file", "engines_dir", "venvs_dir"}
+PATH_KEYS = {"models_dir", "outputs_dir", "logs_dir", "state_file", "engines_dir", "venvs_dir", "holds_dir"}
 ENGINE_KEYS = {"shape", "apis", "install", "launch", "stop", "daemonizes", "ready", "requires"}
 MODEL_KEYS = {"group", "serves", "display", "caps", "routes"}
 ROUTE_KEYS = {"name", "engine", "repo", "include", "revision", "model_path", "lora", "vram_gb",
@@ -308,6 +308,7 @@ class Registry:
         self.state_file = Path(paths.get("state_file", "/content/lm/state.json"))
         self.engines_dir = Path(paths.get("engines_dir", "/content/lm/engines"))
         self.venvs_dir = Path(paths.get("venvs_dir", "/content/lm/venvs"))
+        self.holds_dir = Path(paths.get("holds_dir", "/content/lm/holds"))
         self.vram_margin_gb = _num("vram_margin_gb", top.get("vram_margin_gb", 4))
         self.disk_reserve_gb = _num("disk_reserve_gb", top.get("disk_reserve_gb", 10))
         self.idle_unload_minutes = _num("idle_unload_minutes", top.get("idle_unload_minutes", 45))
