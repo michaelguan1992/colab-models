@@ -8,11 +8,11 @@ import json
 import logging
 import os
 import re
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, TypeVar
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
@@ -20,6 +20,8 @@ from .backends.base import Backend
 from .manager import LOADING_STATES, Manager, RequestHandle
 
 log = logging.getLogger("lm.controller")
+
+T = TypeVar("T")
 
 HOP_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-encoding",
                "te", "trailer", "upgrade", "proxy-authorization", "authorization", "x-api-key"}
@@ -45,6 +47,28 @@ class UnloadReq(BaseModel):
 
 def _openai_error(status: int, msg: str) -> JSONResponse:
     return JSONResponse({"error": {"message": msg, "type": "lm_controller"}}, status_code=status)
+
+
+async def until_disconnect(request: Request, work: Awaitable[T]) -> T | None:
+    """Await ``work`` unless the client disconnects first; then cancel it and return None.
+
+    A non-streaming generation sends nothing until it is done, so without this the engine
+    finishes a long answer nobody is waiting for. Call only after the request body is read.
+    """
+    async def gone() -> None:
+        while (await request.receive())["type"] != "http.disconnect":
+            pass
+
+    task, watch = asyncio.ensure_future(work), asyncio.ensure_future(gone())
+    try:
+        await asyncio.wait({task, watch}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        watch.cancel()
+        if not task.done():
+            task.cancel()
+    if task.cancelled():
+        return None
+    return task.result()
 
 
 async def tracked_stream(handle: RequestHandle, stream: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
@@ -175,7 +199,10 @@ def create_app(manager: Manager, idle_poll_s: float = 30, autoload: str | None =
                                         params=request.query_params, headers=headers, content=body)
         handle = manager.begin_request(activity=inference)
         try:
-            r = await client.send(upstream, stream=True)
+            r = await until_disconnect(request, client.send(upstream, stream=True))
+            if r is None:  # the client left before the engine answered; dropping the send aborts the engine
+                handle.finish()
+                return Response(status_code=499)
         except httpx.HTTPError as e:
             handle.finish()
             return _openai_error(502, f"上游 {llm.id} 无响应: {e}")

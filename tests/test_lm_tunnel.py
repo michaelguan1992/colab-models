@@ -44,3 +44,29 @@ def test_start_refuses_foreign_port_owner(monkeypatch):
     monkeypatch.setattr(tunnel, "stop", lambda: False)
     with pytest.raises(tunnel.PortConflict, match="本地端口 9123 被其他程序占用.*local_port"):
         tunnel.start(cfg, "proxy")
+
+
+def test_keeper_fails_fast_when_ssh_never_connects():
+    assert tunnel.keep("h", ["sh", "-c", "exit 3"], poll_s=0.01, alive=lambda: False, sleep=lambda s: None) == 3
+
+
+class Stop(Exception):
+    pass
+
+
+def test_keeper_restarts_a_dropped_connection_with_backoff_that_resets_once_up(monkeypatch):
+    waits, runs = [], []
+    real_popen = tunnel.subprocess.Popen
+    monkeypatch.setattr(tunnel.subprocess, "Popen", lambda *a, **k: runs.append(1) or real_popen(*a, **k))
+
+    def sleep(s):
+        if s >= 1:  # backoff sleeps; poll sleeps are 0.01
+            waits.append(s)
+            if len(waits) == 4:
+                raise Stop
+
+    # run 1 connects; runs 2 and 3 never come up (backoff grows); run 4 connects (backoff resets)
+    alive = lambda: len(runs) not in (2, 3)
+    with pytest.raises(Stop):
+        tunnel.keep("h", ["sh", "-c", "sleep 0.05"], poll_s=0.01, alive=alive, sleep=sleep)
+    assert waits == [1.0, 2.0, 4.0, 1.0]

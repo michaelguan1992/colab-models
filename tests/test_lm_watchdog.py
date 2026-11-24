@@ -122,3 +122,14 @@ def test_failed_stop_keeps_guarding():
     c = FakeColab()
     c.fail_stop = True
     assert cli.watchdog_tick(CFG, c, cli.WatchState(), 0, idle(100)) is False
+
+
+@pytest.mark.parametrize("keeper_running,restarts", [(True, 0), (False, 1)])
+def test_watchdog_leaves_reconnecting_to_a_live_keeper(monkeypatch, keeper_running, restarts):
+    started = []
+    monkeypatch.setattr(tunnel, "start", lambda cfg, proxy, **kw: started.append(proxy))
+    monkeypatch.setattr(tunnel, "is_running", lambda: keeper_running)
+    cfg, st = Config(idle_stop_minutes=10), cli.WatchState()
+    cli.watchdog_tick(cfg, FakeColab(), st, 1000, None)
+    cli.watchdog_tick(cfg, FakeColab(), st, 1150, None)
+    assert len(started) == restarts

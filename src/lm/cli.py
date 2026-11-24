@@ -250,7 +250,7 @@ def watchdog_tick(cfg: Config, colab: Colab, st: WatchState, now: float, status:
         if now >= st.grace_until and now - st.unreachable_since >= limit:
             _log(f"连续 {limit / 60:.0f} 分钟连不上 controller，自动停止")
             return _guarded_down(cfg, colab)
-        if now - st.unreachable_since > 120:
+        if now - st.unreachable_since > 120 and not tunnel.is_running():  # a live keeper is already retrying
             with state_lock(wait=False) as got:
                 if got:
                     try:

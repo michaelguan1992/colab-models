@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Literal
@@ -76,10 +78,13 @@ def _host(cfg: Config) -> str:
 
 
 def master_alive(cfg: Config) -> bool:
+    return _master_alive_host(_host(cfg))
+
+
+def _master_alive_host(host: str) -> bool:
     if not CONTROL_PATH.exists():
         return False
-    r = subprocess.run(["ssh", "-S", str(CONTROL_PATH), "-O", "check", _host(cfg)],
-                       capture_output=True, text=True)
+    r = subprocess.run(["ssh", "-S", str(CONTROL_PATH), "-O", "check", host], capture_output=True, text=True)
     return r.returncode == 0
 
 
@@ -95,7 +100,11 @@ def run(cfg: Config, command: str, capture: bool = False,
 
 def start(cfg: Config, proxy_command: str, wait_s: float = 60, require_health: bool = True) -> None:
     """Open the tunnel. require_health=False only waits for the ssh master, for use before the
-    controller exists (deploy runs over the master)."""
+    controller exists (deploy runs over the master).
+
+    The pid on file is a keeper that reopens ssh whenever it exits after having connected once
+    (network drop, Mac waking from sleep), so harnesses see a gap of seconds, not minutes.
+    """
     stop()
     if probe(cfg).state == "foreign":
         raise PortConflict(conflict_message(cfg))
@@ -107,8 +116,9 @@ def start(cfg: Config, proxy_command: str, wait_s: float = 60, require_health: b
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ExitOnForwardFailure=yes",
-        "-o", "ServerAliveInterval=30",
-        "-o", "ServerAliveCountMax=4",
+        # A dead link (sleep, Wi-Fi change) is noticed after ~30s instead of ~2min.
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=2",
         "-o", "LogLevel=ERROR",
         "-o", "ControlMaster=yes",
         "-o", f"ControlPath={CONTROL_PATH}",
@@ -116,7 +126,8 @@ def start(cfg: Config, proxy_command: str, wait_s: float = 60, require_health: b
         _host(cfg),
     ]
     log = open(LOG_FILE, "ab")
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    p = subprocess.Popen([sys.executable, "-m", "lm.tunnel", _host(cfg), json.dumps(cmd)],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     PID_FILE.write_text(str(p.pid))
     deadline = time.time() + wait_s
     while time.time() < deadline:
@@ -126,6 +137,31 @@ def start(cfg: Config, proxy_command: str, wait_s: float = 60, require_health: b
             return
         time.sleep(1)
     raise RuntimeError(f"{wait_s:.0f}s 内隧道未连通，见 {LOG_FILE}")
+
+
+def keep(host: str, cmd: list[str], poll_s: float = 1, max_backoff_s: float = 30,
+         alive=None, sleep=time.sleep) -> int:
+    """Run ssh, and run it again each time it exits, once it has connected at least once.
+
+    A first attempt that never connects returns ssh's exit code, so `start` still fails fast
+    on a wrong session or a taken port. Retries back off from 1s to max_backoff_s and reset
+    once a connection is up again.
+    """
+    alive = alive or (lambda: _master_alive_host(host))
+    ever_up, backoff = False, 1.0
+    while True:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+        up = False
+        while p.poll() is None:
+            if not up and alive():
+                up = ever_up = True
+                backoff = 1.0
+            sleep(poll_s)
+        if not ever_up:
+            return p.returncode
+        print(f"{time.strftime('%H:%M:%S')} ssh 退出 (code {p.returncode})，{backoff:.0f}s 后重连", flush=True)
+        sleep(backoff)
+        backoff = min(backoff * 2, max_backoff_s)
 
 
 def stop() -> bool:
@@ -142,3 +178,7 @@ def stop() -> bool:
 
 def is_running() -> bool:
     return _pid() is not None
+
+
+if __name__ == "__main__":  # the keeper process spawned by start()
+    sys.exit(keep(sys.argv[1], json.loads(sys.argv[2])))

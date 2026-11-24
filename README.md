@@ -48,6 +48,10 @@ G4 经常返回 503（没有空闲容量，不是账号问题）。`lm up` 按 `
 - Mac 睡眠时 watchdog 不运行，所以离开前最好手动 `lm down`。
 - dsh 轮询模型列表不算活动，不会让会话一直开着。
 
+### 断线
+- 隧道由一个守护进程看着。ssh 退出（断网、换 Wi-Fi、Mac 睡醒）后，它 1 秒后重连，连不上就把间隔逐次加倍，最长 30 秒。链路悄悄断掉时，ssh 约 30 秒内就能发现。日志在 `~/.local/state/lm/tunnel.log`。
+- 客户端中途断开（关掉对话、按停止、超时）时，controller 会立刻断开到引擎的连接，GPU 不会继续生成没人要的回答。流式和非流式请求都是这样。
+
 ### 配置（`~/.config/lm/config.toml`，都是可选项）
 ```toml
 accelerators = [{gpu = "G4"}, {gpu = "A100", high_mem = true}]

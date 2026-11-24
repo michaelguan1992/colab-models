@@ -149,3 +149,11 @@ colab ssh -s localmodels -- bash -lc 'python3 -m venv /content/fv && /content/fv
   - 没能让 LLM 在 harness 里调用 `generate`：G4 上 Inkling（1M 上下文）和 Pika 放不下，而能和 Pika 共存的 qwen-tiny 只有 8K 上下文，装不下 dsh 或 Claude Code 的系统提示。工具本身和 harness 的接线都已分别验证。
 - Claude Code 2.1.330（`lm claude -p`）：经 Inkling 回答正常，调用 MCP 工具 `mcp__lm__status` 也正常。自定义模型 id 要设 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`，否则它按 1M 估算并打警告。`lm claude` 现在按 caps 设置这个值。
 - dsh：`lm connect dsh` 写入后，正在运行的 dsh 热加载了 provider 和 MCP server。新会话里能看到 `mcp__lm__status` 等 6 个工具，并成功调用。MCP 管理器在 patch 里的行 id 是 `mcp-manager`，不是它 README 示例里的 `mcp`。dsh 的 MCP 工具默认超时 60 秒，不够 `generate` 用，所以写入了 `toolCallTimeoutMs: 1800000`。
+
+## 10. 第 5 阶段：隧道和连接（G4，2026-11-23）
+
+只做了隧道和连接。`Provider` 接口和远端自释放按你的决定不做。
+
+- 隧道重连：杀掉 ssh 进程后，守护进程 1 秒后重开 ssh，3.3 秒后 `/health` 恢复。之前要等 watchdog 发现连不上超过 2 分钟才重连。
+- 客户端断开：让 Inkling 写 8000 token 的长文，客户端 4 秒后放弃。非流式和流式两种请求，GPU 利用率都从 99% 在 5 秒内降到 0，`inflight.requests` 回到 0。修之前，非流式请求断开后引擎会继续生成到结束；流式请求本来就会停。
+- 远端自释放的可行性（没有实现，记下备查）：`google.colab.runtime.unassign()` 只是向环境变量 `TBE_RUNTIME_ADDR` 指向的地址发 `POST /unassign`，不依赖 notebook 前端，所以从 ssh 里也应该能调用。没有实际调用过。
