@@ -136,3 +136,4 @@ colab ssh -s localmodels -- bash -lc 'python3 -m venv /content/fv && /content/fv
 - 速度：端到端约 260 tok/s（Strata 约 96 tok/s，约 2.7 倍）；引擎侧 317–407 tok/s，DSpark 接受率 73–96%。
 - 工具调用、看图都正常。Basalt 下 Inkling 默认开思考，`reasoning_effort` 有效（none / low / high 的思考量逐级增加）。
 - 私有仓库 `mgresearch/colab-models-basalt`（commit `4c0f85f3`）存放转换好的 `Inkling-2-Mini-Uncensored-OU.basalt`（19.6GB）。HF_TOKEN 经 ssh stdin 送到运行时（ControlMaster 路径，37 字节，权限 600）。从仓库下载约 1 分钟，启动约 10 秒，端到端约 248 tok/s。
+- 上下文：模型原生 1M（`model_max_length` 1048576；24 层里 20 层是 1024 窗口的滑动注意力，只有 4 层全局）。`--max-context` 32K 时 19.9GB，64K 时 20.9GB，1M 时 54.7GB。1M 下 239K token 的提示 26.6 秒读完，能找回开头埋的口令。代价是 G4 上 Pika 不能再和 Inkling 同时在线。

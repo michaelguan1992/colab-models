@@ -4,14 +4,14 @@
 
 | id | 模型 | 引擎 | 显存估计 |
 |---|---|---|---|
-| `inkling` | AtomicChat/Inkling-2-Mini-Uncensored-GGUF（Q4_K） | Strata | ~18GB |
+| `inkling` | G4：OpenUncensored/Inkling-2-Mini-Uncensored（Basalt 包，1M 上下文）；其他 GPU：AtomicChat GGUF（Q4_K，32K） | Basalt / Strata | ~55GB / ~18GB |
 | `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF（IQ3_XXS） | Strata | ~50GB |
 | `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF（Q8_0，演示用） | llama.cpp | ~2GB |
 | `pika` | Pika-H3-Flex + Turbo LoRA（4 步，**视频+音频**） | diffusers | ~69GB |
 
 **调度规则**（写在 `remote/models.yaml` 的 `rules`，由 controller 对"加载之后的在线集合"强制执行，`remote/controller/policy.py`）
 1. 同一时间最多一个 `llm` 组的模型在线（`max_online: 1, on_conflict: swap`）。加载另一个时，会先把同组当前的卸载掉。
-2. 只有在线 `llm` 组模型的**实测**显存低于 22GB 时，`video` 组的 `pika` 才能上线（`requires_online_below`）。所以 Inkling 可以和 Pika 同时在线，Qwen 不行。
+2. 只有在线 `llm` 组模型的**实测**显存低于 22GB 时，`video` 组的 `pika` 才能上线（`requires_online_below`）。在 G4 上 Inkling 走 Basalt、开 1M 上下文，实测 54.7GB，所以 Pika 只能单独在线（演示用的 qwen-tiny 除外）。
 3. 45 分钟没有请求，自动卸载所有模型（`idle_unload_minutes`）。
 
 ## 一次性准备

@@ -102,11 +102,11 @@ models:
         include: [Inkling-2-Mini-Uncensored-OU.basalt]
         model_path: Inkling-2-Mini-Uncensored-OU.basalt
         est_download_gb: 19.6
-        vram_gb: 24
-        caps: {vision: true, context: 65536, reasoning: [none, low, medium, high]}   # Basalt runs Inkling with thinking on; Strata does not
+        vram_gb: 56
+        caps: {vision: true, context: 1048576, reasoning: [none, low, medium, high]}   # Basalt runs Inkling with thinking on; Strata does not
         # --fit-max-tokens: harnesses like dsh send max_tokens=128000; Basalt refuses instead of clamping without it.
         # dsh's system prompt and tools alone are ~23K tokens, so 32K left almost no room for the conversation.
-        extra: ["--max-context", "65536", "--fit-max-tokens", "--vision", "dynamic"]  # images are encoded in the engine
+        extra: ["--max-context", "1048576", "--fit-max-tokens", "--vision", "dynamic"]  # images are encoded in the engine
       - engine: strata
         repo: AtomicChat/Inkling-2-Mini-Uncensored-GGUF
         include:
@@ -185,4 +185,4 @@ models:
 # online, every online member of the named group must use less than vram_gb (measured, else estimated).
 rules:
   - {group: llm, max_online: 1, on_conflict: swap}
-  - {group: video, requires_online_below: {group: llm, vram_gb: 22}}   # Inkling on Basalt with 64K context measures 20.9GB; Pika (64GB peak) still fits
+  - {group: video, requires_online_below: {group: llm, vram_gb: 22}}   # Inkling on Basalt (1M context) measures 54.7GB, so on the G4 Pika runs alone
