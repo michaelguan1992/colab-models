@@ -219,7 +219,7 @@ def test_models_endpoint_omits_context_length_when_caps_lack_it():
 
 def test_status_reports_group_serves_caps_and_engine_per_model():
     raw = raw_registry()
-    next(r for r in raw["models"]["inkling"]["routes"] if r["engine"] == "strata")["caps"] = {"vision": True}
+    next(r for r in raw["models"]["inkling"]["routes"] if r.get("name", r["engine"]) == "strata")["caps"] = {"vision": True}
     client, _ = make_client(registry=tmp_registry(raw))
     with client:
         models = {m["id"]: m for m in client.get("/admin/status").json()["models"]}

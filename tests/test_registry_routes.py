@@ -16,7 +16,7 @@ def two_route_raw():
     fast = {"name": "fast", "engine": "strata", "model_path": "fast.gguf", "vram_gb": 20,
             "est_download_gb": 15, "requires": {"sm": [120]}, "caps": {"vision": True}}
     raw["models"]["inkling"]["caps"] = {"tools": True}
-    strata = next(r for r in raw["models"]["inkling"]["routes"] if r["engine"] == "strata")
+    strata = next(r for r in raw["models"]["inkling"]["routes"] if r.get("name", r["engine"]) == "strata")
     raw["models"]["inkling"]["routes"] = [fast, strata]
     return raw
 
@@ -209,10 +209,16 @@ def test_shipped_registry_prefers_basalt_on_blackwell_and_strata_elsewhere():
     assert reg.choose("inkling", "8.0").route.engine == "strata"
 
 
+def test_inkling_gets_1m_on_big_gpus_and_32k_on_small_ones():
+    reg = Registry(copy.deepcopy(RAW))
+    assert [reg.choose("inkling", cc).route.caps["context"] for cc in ("12.0", "9.0", "8.0", "8.9")] == \
+        [1048576, 1048576, 1048576, 32768]
+
+
 def test_qwen_reads_images_on_every_route_and_inkling_only_on_basalt():
     reg = Registry(copy.deepcopy(RAW))
     assert all(r.caps["vision"] for r in reg.routes("qwen"))
-    assert [r.caps["vision"] for r in reg.routes("inkling")] == [True, False]  # Strata refuses Inkling images
+    assert [r.caps["vision"] for r in reg.routes("inkling")] == [True, False, False]  # Strata refuses Inkling images
 
 
 def test_pika_runs_fp8_only_where_the_gpu_has_fp8():

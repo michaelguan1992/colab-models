@@ -10,8 +10,8 @@ The target runtime is a Colab G4 (RTX PRO 6000 Blackwell, 96GB). A100 80GB and s
 
 | id | Model | Engine | VRAM |
 |---|---|---|---|
-| `inkling` | G4: OpenUncensored/Inkling-2-Mini-Uncensored as a Basalt pack (1M context). Other GPUs: the AtomicChat GGUF (Q4_K, 32K) | Basalt / Strata | ~55GB / ~18GB |
-| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF (IQ3_XXS). G4: converted to a Basalt pack (262K context, vision). Other GPUs: the GGUF on Strata (also 262K) | Basalt / Strata | ~50GB / ~62GB |
+| `inkling` | G4: OpenUncensored/Inkling-2-Mini-Uncensored as a Basalt pack (1M context). A100/H100: the AtomicChat GGUF (Q4_K, 1M); smaller GPUs: the same GGUF at 32K | Basalt / Strata | ~55GB / ~36GB (estimate) / ~18GB |
+| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF (IQ3_XXS). G4: converted to a Basalt pack. Other GPUs: the GGUF on Strata. Both read images and run 1M context, 4x the trained 262K through YaRN, which also changes short prompts' output | Basalt / Strata | ~70GB / ~70GB (estimates at 1M) |
 | `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF (Q8_0, for demos) | llama.cpp | ~2GB |
 | `pika` | Pika-H3-Flex with the official fl2va adapter (6 steps, **video and audio**). On the G4 it runs in FP8, fully resident: about 36 s for a 5 s clip | diffusers | ~78GB |
 | `moss` | OpenMOSS-Team/MOSS-Image-SFT with lodestones' 8-step LoRA (CFG 1, **images**). Resident on A100/H100/G4, CPU offload elsewhere. About 44 s per 1024px image on an L4 | diffusers (model's own pipeline) | ~32GB (estimate, not measured on the G4) |
@@ -24,7 +24,7 @@ The rules live in the `rules` section of `remote/models.yaml`. The controller ch
 
 1. **One LLM at a time.** At most one model of the `llm` group is online (`max_online: 1, on_conflict: swap`). Loading another LLM unloads the current one first.
 2. **Pika needs a small LLM.** `pika` (group `video`) loads only while the online LLM's *measured* VRAM is under 22GB (`requires_online_below`). On the G4, Inkling on Basalt with 1M context measures 54.7GB, so Pika runs alone (or next to the `qwen-tiny` demo model).
-   `moss` (group `image`) has no rule of its own. Only the VRAM check applies: online models plus the new one must fit in total VRAM minus a margin. On the G4 that lets it share with either LLM, but not with Pika.
+   `moss` (group `image`) has no rule of its own. Only the VRAM check applies: online models plus the new one must fit in total VRAM minus a margin. On the G4 that lets it share with Inkling, but not with Qwen at 1M or with Pika.
 3. **Idle unload.** After 45 minutes without requests, all models are unloaded (`idle_unload_minutes`).
    Work you start by hand on the runtime counts as activity. That means a GPU process that belongs to no loaded model, or any file in `/content/lm/holds/`. Use a hold file for CPU or network work such as conversions and downloads, and delete it when done. `lm status` lists this external work.
 

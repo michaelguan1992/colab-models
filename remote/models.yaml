@@ -117,15 +117,29 @@ models:
         # --fit-max-tokens: harnesses like dsh send max_tokens=128000; Basalt refuses instead of clamping without it.
         # dsh's system prompt and tools alone are ~23K tokens, so 32K left almost no room for the conversation.
         extra: ["--max-context", "1048576", "--fit-max-tokens", "--vision", "dynamic"]  # images are encoded in the engine
-      - engine: strata
+      # A100 / H100: the full 1M. 18.6GB measured at 32K on the A100; 36GB at 1M is an estimate, not yet measured:
+      # Strata's inkling_fit puts the global KV at 16 KiB/token in int8 (8 of 48 visits; the SWA-1024 visits
+      # stay ~0.1GB), so ~17GB more.
+      - name: strata-1m
+        engine: strata
+        requires: {sm: [80, 90, 100]}
         repo: AtomicChat/Inkling-2-Mini-Uncensored-GGUF
-        include:
+        include: &inkling_gguf
           - Inkling-2-Mini-Uncensored-AD-Q4_K.gguf
           - mmproj-Inkling-2-Mini-Uncensored-BF16.gguf
         model_path: Inkling-2-Mini-Uncensored-AD-Q4_K.gguf
+        vram_gb: 36
+        est_download_gb: 17.2
+        caps: {context: 1048576}
+        extra: ["--context", "1048576", "--drafting", "auto"]  # no MTP head in this GGUF; DSpark drafter needs llama.cpp
+      # Smaller GPUs (L4 and the like): 32K keeps it at 18.6GB.
+      - engine: strata
+        repo: AtomicChat/Inkling-2-Mini-Uncensored-GGUF
+        include: *inkling_gguf
+        model_path: Inkling-2-Mini-Uncensored-AD-Q4_K.gguf
         vram_gb: 18
         est_download_gb: 17.2
-        extra: ["--context", "32k", "--drafting", "auto"]  # no MTP head in this GGUF; DSpark drafter needs llama.cpp
+        extra: ["--context", "32k", "--drafting", "auto"]
 
   qwen:
     group: llm
@@ -141,21 +155,28 @@ models:
         include: [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS.basalt]
         model_path: Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS.basalt
         est_download_gb: 80.2
-        vram_gb: 50   # G4: 46.0GB after load, 49.6GB after a 150K-token prompt (Strata: 53.9GB at 32K)
-        caps: {vision: true, context: 262144}   # native context (qwen4exp.context_length)
-        extra: ["--max-context", "262144", "--fit-max-tokens"]
+        # 1M is 4x the trained 262144, so YaRN (factor 4). Basalt only scales when asked, and the scaling changes
+        # every position's rotation, so short prompts' output changes too. Not yet run at 1M.
+        # VRAM: G4 at 262K was 46.0GB after load and 49.6GB after a 150K-token prompt (elastic KV grows with use);
+        # 70GB at 1M is that growth extrapolated, an estimate.
+        vram_gb: 70
+        caps: {vision: true, context: 1048576}
+        extra: ["--max-context", "1048576", "--rope-scaling", "yarn", "--rope-scale", "4", "--fit-max-tokens"]
       - engine: strata
         repo: SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF
         include:
           - IQ3_XXS/*
           - mtp-q2_0.gguf          # Strata-only draft head
         model_path: IQ3_XXS        # folder of shards; shard 2 (n-gram table) should stay mmapped
-        vram_gb: 62   # A100: 55.8GB after load, 61.6GB after a 172K-token prompt (42 s, recalled)
+        # A100 at the trained 262144: 55.8GB after load, 61.6GB after a 172K-token prompt (42 s, recalled).
+        # 1M: past 262144 Strata's launcher adds YaRN itself (factor = 1M / 262144 = 4) and fits the rest to the card;
+        # 70GB is an estimate, not yet run.
+        vram_gb: 70
         est_download_gb: 77
-        # context: native (trained), past it Strata would add YaRN scaling. vision: Strata fetches the mmproj itself
-        # and runs strata-vision on the GPU; checked on the A100 over /v1/chat/completions and /v1/messages.
-        caps: {vision: true, context: 262144}
-        extra: ["--context", "262144", "--drafting", "auto"]
+        # vision: Strata fetches the mmproj itself and runs strata-vision on the GPU; checked on the A100 over
+        # /v1/chat/completions and /v1/messages.
+        caps: {vision: true, context: 1048576}
+        extra: ["--context", "1048576", "--drafting", "auto"]
 
   qwen-tiny:
     group: llm

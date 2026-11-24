@@ -10,8 +10,8 @@
 
 | id | 模型 | 引擎 | 显存 |
 |---|---|---|---|
-| `inkling` | G4：OpenUncensored/Inkling-2-Mini-Uncensored 的 Basalt 包（1M 上下文）。其他 GPU：AtomicChat 的 GGUF（Q4_K，32K） | Basalt / Strata | ~55GB / ~18GB |
-| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF（IQ3_XXS）。G4：转成 Basalt 包（262K 上下文，能看图）。其他 GPU：GGUF 走 Strata（同样 262K） | Basalt / Strata | ~50GB / ~62GB |
+| `inkling` | G4：OpenUncensored/Inkling-2-Mini-Uncensored 的 Basalt 包（1M 上下文）。A100/H100：AtomicChat 的 GGUF（Q4_K，1M）；更小的 GPU：同一个 GGUF，32K | Basalt / Strata | ~55GB / ~36GB（估计）/ ~18GB |
+| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF（IQ3_XXS）。G4：转成 Basalt 包。其他 GPU：GGUF 走 Strata。两者都能看图，上下文都是 1M，即用 YaRN 把训练长度 262K 扩到 4 倍，短 prompt 的输出也会因此改变 | Basalt / Strata | ~70GB / ~70GB（1M 下的估计） |
 | `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF（Q8_0，演示用） | llama.cpp | ~2GB |
 | `pika` | Pika-H3-Flex 加官方 fl2va adapter（6 步，**视频加音频**）。G4 上跑 FP8，整个模型常驻显存，5 秒视频约 36 秒 | diffusers | ~78GB |
 | `moss` | OpenMOSS-Team/MOSS-Image-SFT 加 lodestones 的 8 步 LoRA（CFG 1，**图像**）。A100/H100/G4 上常驻显存，其他 GPU 用 CPU offload。L4 上 1024px 每张约 44 秒 | diffusers（模型自带的 pipeline） | ~32GB（估计，G4 上未实测） |
@@ -24,7 +24,7 @@
 
 1. **同一时间只有一个 LLM。** `llm` 组最多一个模型在线（`max_online: 1, on_conflict: swap`）。加载另一个 LLM 时，会先卸载当前的。
 2. **Pika 要求 LLM 足够小。** `pika`（`video` 组）只有在在线 LLM 的**实测**显存低于 22GB 时才能加载（`requires_online_below`）。G4 上 Inkling 走 Basalt、开 1M 上下文，实测 54.7GB，所以 Pika 只能单独在线（演示用的 `qwen-tiny` 除外）。
-   `moss`（`image` 组）没有专门的规则，只受显存检查约束：在线模型加上新模型，不能超过总显存减去余量。在 G4 上，它能和任一 LLM 同时在线，但不能和 Pika 同时在线。
+   `moss`（`image` 组）没有专门的规则，只受显存检查约束：在线模型加上新模型，不能超过总显存减去余量。在 G4 上，它能和 Inkling 同时在线，但不能和 1M 上下文的 Qwen 或 Pika 同时在线。
 3. **空闲卸载。** 45 分钟没有请求，卸载所有模型（`idle_unload_minutes`）。
    在运行时上手动跑的任务也算活动，包括：不属于任何已加载模型的 GPU 进程，以及 `/content/lm/holds/` 里的任何文件。转换、下载这类不用 GPU 的任务，开始时放一个 hold 文件，跑完删掉。`lm status` 会列出这些外部任务。
 
