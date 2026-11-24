@@ -209,6 +209,12 @@ def test_shipped_registry_prefers_basalt_on_blackwell_and_strata_elsewhere():
     assert reg.choose("inkling", "8.0").route.engine == "strata"
 
 
+def test_qwen_reads_images_on_every_route_and_inkling_only_on_basalt():
+    reg = Registry(copy.deepcopy(RAW))
+    assert all(r.caps["vision"] for r in reg.routes("qwen"))
+    assert [r.caps["vision"] for r in reg.routes("inkling")] == [True, False]  # Strata refuses Inkling images
+
+
 def test_pika_runs_fp8_only_where_the_gpu_has_fp8():
     reg = Registry(copy.deepcopy(RAW))
     assert reg.choose("pika", "12.0").route.name == "fp8" and reg.choose("pika", "8.9").route.name == "fp8"
