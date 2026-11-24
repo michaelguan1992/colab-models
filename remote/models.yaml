@@ -150,9 +150,10 @@ models:
           - IQ3_XXS/*
           - mtp-q2_0.gguf          # Strata-only draft head
         model_path: IQ3_XXS        # folder of shards; shard 2 (n-gram table) should stay mmapped
-        vram_gb: 50
+        vram_gb: 62   # A100: 55.8GB after load, 61.6GB after a 172K-token prompt (42 s, recalled)
         est_download_gb: 77
-        extra: ["--context", "32k", "--drafting", "auto"]  # spike: dflash2 vs mtp
+        caps: {context: 262144}    # native (trained) context; past it Strata would add YaRN scaling
+        extra: ["--context", "262144", "--drafting", "auto"]
 
   qwen-tiny:
     group: llm

@@ -37,6 +37,7 @@ class Runner:
 
 @pytest.fixture
 def make(monkeypatch, src):
+    monkeypatch.delenv(Config().hf_token_env, raising=False)  # a token in the shell adds a push before the deploy
     def build(**cfg_kw):
         runner = Runner()
         monkeypatch.setattr(colab_mod.subprocess, "run", runner)

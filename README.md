@@ -11,7 +11,7 @@ The target runtime is a Colab G4 (RTX PRO 6000 Blackwell, 96GB). A100 80GB and s
 | id | Model | Engine | VRAM |
 |---|---|---|---|
 | `inkling` | G4: OpenUncensored/Inkling-2-Mini-Uncensored as a Basalt pack (1M context). Other GPUs: the AtomicChat GGUF (Q4_K, 32K) | Basalt / Strata | ~55GB / ~18GB |
-| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF (IQ3_XXS). G4: converted to a Basalt pack (262K context, vision). Other GPUs: the GGUF (32K) | Basalt / Strata | ~50GB / ~54GB |
+| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF (IQ3_XXS). G4: converted to a Basalt pack (262K context, vision). Other GPUs: the GGUF on Strata (also 262K) | Basalt / Strata | ~50GB / ~62GB |
 | `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF (Q8_0, for demos) | llama.cpp | ~2GB |
 | `pika` | Pika-H3-Flex with the official fl2va adapter (6 steps, **video and audio**). On the G4 it runs in FP8, fully resident: about 36 s for a 5 s clip | diffusers | ~78GB |
 | `moss` | OpenMOSS-Team/MOSS-Image-SFT with lodestones' 8-step LoRA (CFG 1, **images**). Resident on A100/H100/G4, CPU offload elsewhere. About 44 s per 1024px image on an L4 | diffusers (model's own pipeline) | ~32GB (estimate, not measured on the G4) |

@@ -11,7 +11,7 @@
 | id | 模型 | 引擎 | 显存 |
 |---|---|---|---|
 | `inkling` | G4：OpenUncensored/Inkling-2-Mini-Uncensored 的 Basalt 包（1M 上下文）。其他 GPU：AtomicChat 的 GGUF（Q4_K，32K） | Basalt / Strata | ~55GB / ~18GB |
-| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF（IQ3_XXS）。G4：转成 Basalt 包（262K 上下文，能看图）。其他 GPU：直接用 GGUF（32K） | Basalt / Strata | ~50GB / ~54GB |
+| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF（IQ3_XXS）。G4：转成 Basalt 包（262K 上下文，能看图）。其他 GPU：GGUF 走 Strata（同样 262K） | Basalt / Strata | ~50GB / ~62GB |
 | `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF（Q8_0，演示用） | llama.cpp | ~2GB |
 | `pika` | Pika-H3-Flex 加官方 fl2va adapter（6 步，**视频加音频**）。G4 上跑 FP8，整个模型常驻显存，5 秒视频约 36 秒 | diffusers | ~78GB |
 | `moss` | OpenMOSS-Team/MOSS-Image-SFT 加 lodestones 的 8 步 LoRA（CFG 1，**图像**）。A100/H100/G4 上常驻显存，其他 GPU 用 CPU offload。L4 上 1024px 每张约 44 秒 | diffusers（模型自带的 pipeline） | ~32GB（估计，G4 上未实测） |
