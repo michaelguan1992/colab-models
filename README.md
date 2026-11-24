@@ -5,9 +5,10 @@
 | id | 模型 | 引擎 | 显存估计 |
 |---|---|---|---|
 | `inkling` | G4：OpenUncensored/Inkling-2-Mini-Uncensored（Basalt 包，1M 上下文）；其他 GPU：AtomicChat GGUF（Q4_K，32K） | Basalt / Strata | ~55GB / ~18GB |
-| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF（IQ3_XXS） | Strata | ~50GB |
+| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF（IQ3_XXS）。G4：转成 Basalt 包（262K 上下文，能看图）；其他 GPU：GGUF（32K） | Basalt / Strata | ~50GB / ~54GB |
 | `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF（Q8_0，演示用） | llama.cpp | ~2GB |
-| `pika` | Pika-H3-Flex + Turbo LoRA（4 步，**视频+音频**） | diffusers | ~69GB |
+| `pika` | Pika-H3-Flex + 官方 fl2va adapter（6 步，**视频+音频**）；G4 上 FP8、常驻显存，5 秒视频约 36 秒 | diffusers | ~78GB |
+| `moss` | OpenMOSS-Team/MOSS-Image-SFT + lodestones 8 步 LoRA（CFG 1，**图像**）；A100/H100/G4 常驻显存，其他 GPU 分批放进显存（offload）。L4 上 1024px 每张约 44 秒 | diffusers（自带 pipeline） | ~32GB（估计，G4 未实测） |
 
 **调度规则**（写在 `remote/models.yaml` 的 `rules`，由 controller 对"加载之后的在线集合"强制执行，`remote/controller/policy.py`）
 1. 同一时间最多一个 `llm` 组的模型在线（`max_online: 1, on_conflict: swap`）。加载另一个时，会先把同组当前的卸载掉。

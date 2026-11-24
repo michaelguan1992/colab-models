@@ -30,8 +30,6 @@ def route_provides(engine: Engine, route: Route) -> set[str]:
     names = engine_provides(engine) | {"model_dir", "extra", *route.params}
     if route.model_path:
         names.add("model_path")
-    if route.lora:
-        names |= {"lora_dir", "lora_file"}
     return names
 
 

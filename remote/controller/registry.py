@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 import yaml
 
 from .policy import MaxOnline, RequiresBelow, Rule, Spec
-from .spec import (Archive, ArchiveInstall, Engine, Install, Lora, ModelSpec, Ready, Route, ScriptInstall,
+from .spec import (Archive, ArchiveInstall, Engine, Install, ModelSpec, Ready, Route, ScriptInstall,
                    VenvInstall)
 from .templating import EXTRA, INSTALL_PLACEHOLDERS, engine_provides, placeholders, route_provides
 
@@ -23,7 +23,7 @@ TOP_KEYS = {"paths", "idle_unload_minutes", "vram_margin_gb", "disk_reserve_gb",
 PATH_KEYS = {"models_dir", "outputs_dir", "logs_dir", "state_file", "engines_dir", "venvs_dir", "holds_dir"}
 ENGINE_KEYS = {"shape", "apis", "install", "launch", "stop", "daemonizes", "ready", "requires"}
 MODEL_KEYS = {"group", "serves", "display", "caps", "routes"}
-ROUTE_KEYS = {"name", "engine", "repo", "include", "revision", "model_path", "lora", "vram_gb",
+ROUTE_KEYS = {"name", "engine", "repo", "include", "revision", "model_path", "vram_gb",
               "est_download_gb", "port", "requires", "caps", "extra", "params", "ready_timeout_s"}
 
 
@@ -222,11 +222,6 @@ def _parse_route(where: str, raw: dict[str, Any], model_caps: Mapping[str, Any],
     else:
         sm = route_sm or engine.requires_sm
 
-    lora = None
-    if "lora" in raw:
-        ld = _keys(f"{where}.lora", raw["lora"], {"repo", "file", "revision"}, {"repo", "file"})
-        lora = Lora(_str(f"{where}.lora.repo", ld["repo"]), _str(f"{where}.lora.file", ld["file"]),
-                    _str(f"{where}.lora.revision", ld["revision"]) if ld.get("revision") else None)
     params = raw.get("params", {})
     if not isinstance(params, dict) or not all(
             isinstance(k, str) and isinstance(v, (str, int, float)) for k, v in params.items()):
@@ -234,8 +229,8 @@ def _parse_route(where: str, raw: dict[str, Any], model_caps: Mapping[str, Any],
     extra = _extra(f"{where}.extra", raw.get("extra", []))
     include = _strs(f"{where}.include", raw.get("include", []))
     repo = _str(f"{where}.repo", raw["repo"]) if "repo" in raw else None
-    if (include or lora) and not repo:
-        raise RegistryError(f"{where} 写了 include / lora 但没有 repo")
+    if include and not repo:
+        raise RegistryError(f"{where} 写了 include 但没有 repo")
     est = _num(f"{where}.est_download_gb", raw["est_download_gb"]) if "est_download_gb" in raw else 0.0
     route = Route(
         name=_str(f"{where}.name", raw["name"]) if "name" in raw else ename, engine=ename,
@@ -243,17 +238,17 @@ def _parse_route(where: str, raw: dict[str, Any], model_caps: Mapping[str, Any],
         requires_sm=sm, repo=repo, include=include,
         revision=_str(f"{where}.revision", raw["revision"]) if raw.get("revision") else None,
         model_path=_str(f"{where}.model_path", raw["model_path"]) if "model_path" in raw else None,
-        lora=lora, extra=extra, params={k: str(v) for k, v in params.items()},
+        extra=extra, params={k: str(v) for k, v in params.items()},
         caps={**model_caps, **_parse_caps(f"{where}.caps", raw.get("caps"))},
         ready_timeout_s=_num(f"{where}.ready_timeout_s", raw.get("ready_timeout_s", 1800), positive=True))
 
-    clash = set(route.params) & (engine_provides(engine) | {"model_dir", "extra", "model_path", "lora_dir", "lora_file"})
+    clash = set(route.params) & (engine_provides(engine) | {"model_dir", "extra", "model_path"})
     if clash:
         raise RegistryError(f"{where}.params 的名字与内置占位符冲突: {', '.join(sorted(clash))}")
     missing = placeholders(engine.launch) - route_provides(engine, route)
     if missing:
         raise RegistryError(f"{where} 的 engines.{ename}.launch 使用了没有来源的 {_names(missing)}"
-                            "（可由 params、model_path、lora 或引擎安装提供）")
+                            "（可由 params、model_path 或引擎安装提供）")
     if route.extra and EXTRA not in engine.launch:
         raise RegistryError(f"{where}.extra 非空，但 engines.{ename}.launch 没有 {EXTRA}")
     if engine.ready.identity == "model_path" and not route.model_path:

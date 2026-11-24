@@ -157,6 +157,8 @@ class Colab:
             self.upload(tgz, "/content/lm-remote.tgz")
         if self.push_hf_token():
             print("已同步 HF token 到运行时")
+        else:
+            print(f"注意：Mac 上没有 ${self.cfg.hf_token_env}，私有仓库（如 Basalt 包）会下载失败", file=sys.stderr)
         rd = shlex.quote(self.cfg.remote_dir)
         env = {"LM_VERSION": version, "LM_PORT": str(self.cfg.remote_port)}
         if load:

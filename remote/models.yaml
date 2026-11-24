@@ -20,7 +20,7 @@ disk_reserve_gb: 10       # keep free on /content; offline models' weights are d
 #     archive: download + verify each archive, extract, find `bin` by name inside; its dir joins LD_LIBRARY_PATH
 #     venv: python -m venv --system-site-packages, then pip install `pip` and `pip_files` (after the weights download)
 #   launch/stop placeholders: {bin} {venv_python} {model_path} {model_dir} {port} {models_dir} {outputs_dir}
-#     {lora_dir} {lora_file}, any route `params` key as {name}, and {extra} (the route's `extra` list, as its own element)
+#     any route `params` key as {name}, and {extra} (the route's `extra` list, as its own element)
 #   daemonizes: the launcher exits and leaves a server behind; find it through the port listener, stop it with `stop`
 #   ready: {path, identity: model_path} polls path; identity checks the served model is this route's model_path
 #   requires: {sm: [...]} limits the GPU compute capability; a route's own `requires` must hold too
@@ -77,8 +77,7 @@ engines:
       pip: [fastapi, uvicorn, httpx, psutil, "torchao>=0.16"]
       pip_files: ["{model_dir}/examples/requirements-diffusers.txt"]   # pinned diffusers commit
     launch: ["{venv_python}", "-m", "controller.pika_worker",
-             "--model-dir", "{model_dir}", "--lora-dir", "{lora_dir}", "--lora-file", "{lora_file}",
-             "--workflow", "{workflow}", "--steps", "{steps}", "--guidance", "{guidance}",
+             "--model-dir", "{model_dir}", "--adapter-file", "{adapter_file}", "--workflow", "{workflow}",
              "--fps", "{fps}", "--width", "{width}", "--height", "{height}",
              "--outputs-dir", "{outputs_dir}", "--port", "{port}", "{extra}"]
     ready: {path: /health}
@@ -123,6 +122,17 @@ models:
     display: Qwen3.8-Flash-Next abliterated (IQ3_XXS)
     caps: {tools: true, context: 32768, reasoning: [none, low, medium, high]}
     routes:
+      # The same GGUF converted with Basalt's tools/convert (--gguf --mmproj --mtp-source --mtp-dense; remote/bench/phase3.sh),
+      # drafter tensors from the official Qwen3.8 MTP head plus the tuned dense.bin. Private repo; needs HF_TOKEN.
+      - engine: basalt
+        repo: mgresearch/colab-models-basalt
+        revision: 7f958d1b754a57b118665d3d8c7f491966718d76
+        include: [Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS.basalt]
+        model_path: Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS.basalt
+        est_download_gb: 80.2
+        vram_gb: 50   # G4: 46.0GB after load, 49.6GB after a 150K-token prompt (Strata: 53.9GB at 32K)
+        caps: {vision: true, context: 262144}   # native context (qwen4exp.context_length)
+        extra: ["--max-context", "262144", "--fit-max-tokens"]
       - engine: strata
         repo: SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF
         include:
@@ -150,14 +160,22 @@ models:
   pika:
     group: video
     serves: [video]
-    display: Pika-H3-Flex + Turbo LoRA (4-step)
+    display: Pika-H3-Flex (fl2va adapter, 6-step)
     routes:
-      - engine: diffusers
+      # FL2VA/T2V only. Sizes (HF API, 2026-11): transformer 66.3GB, text_encoder 66.7GB
+      # (Qwen3-VL-32B BF16), vae 10.4GB, audio_vae 0.6GB, fl2va/ adapter 2.8GB. Skipped:
+      # transformer_ref/ 66.3GB, ref2va/ adapter, comfy/.
+      # The official adapter is distilled for the pipeline's built-in 6-step schedule. The Turbo LoRA
+      # (Pika-Labs/Pika-H3-Flex-Turbo-LoRA) targets 4 steps at shift 6, which the pipeline does not run;
+      # on the G4 the two measured within 2% of each other (docs/spike.md), so the matched pair wins.
+      # FP8 (torchao, sm_89+): adapter fused, transformer and text encoder in FP8, everything resident.
+      # G4, 5 s at 480p: 35-37 s per clip including the first (bf16 + offload: 78 s warm, 354 s first),
+      # peak 77.5GB; loading takes ~400 s because the weights are read and quantized up front.
+      - name: fp8
+        engine: diffusers
+        requires: {sm: [89, 90, 100, 120]}
         repo: Pika-Labs/Pika-H3-Flex
-        # FL2VA/T2V only. Sizes (HF API, 2026-11): transformer 66.3GB, text_encoder 66.7GB
-        # (Qwen3-VL-32B BF16), vae 10.4GB, audio_vae 0.6GB. Skipped: transformer_ref/ 66.3GB,
-        # ref2va/ + fl2va/ adapters 2.8GB each (Turbo LoRA already fuses the Flex adapter), comfy/.
-        include:
+        include: &pika_files
           - modular_model_index.json
           - transformer/*
           - vae/*
@@ -167,18 +185,23 @@ models:
           - processor/*
           - scheduler/*
           - audio_scheduler/*
+          - fl2va/*
           - examples/requirements-diffusers.txt   # pinned diffusers commit
-        lora:
-          repo: Pika-Labs/Pika-H3-Flex-Turbo-LoRA
-          file: pika_h3_flex_turbo_4step_fl2va.safetensors
-        params: {workflow: fl2va, steps: 4, guidance: 1.0, fps: 24, width: 832, height: 480}  # worker defaults; a /video request overrides width/height
+        params: &pika_params {workflow: fl2va, adapter_file: fl2va/adapter.safetensors, fps: 24, width: 832, height: 480}
         port: 8090
-        vram_gb: 66   # measured peak 64.4GB on G4 with --cpu-offload (480p, 5 s)
-        # Transformer (66GB) and text encoder (67GB, BF16) do not fit together on 96GB; take turns on the GPU.
+        vram_gb: 88   # process usage after a 10 s clip (87.3GB; 5 s clips peak at 77.5GB)
+        extra: ["--fuse", "--fp8", "--fp8-text"]
+        est_download_gb: 147       # 144GB base subset + 2.8GB fl2va adapter
+      # A100 and other GPUs without FP8: bf16, transformer (66GB) and text encoder (67GB) take turns on the GPU.
+      - name: bf16
+        engine: diffusers
+        repo: Pika-Labs/Pika-H3-Flex
+        include: *pika_files
+        params: *pika_params
+        port: 8090
+        vram_gb: 66   # G4 with --cpu-offload: peak 64.4GB while generating; offloaded parts stay cached afterwards
         extra: ["--cpu-offload"]
-        est_download_gb: 148       # 144GB base subset + 3.9GB Turbo LoRA
-        # Alternative under evaluation: FastVideo/Pika-H3-Flex-NVFP4-QAD (~68GB, FastVideo engine,
-        # fixed 6 steps, no Turbo). See docs/spike.md §6 before switching.
+        est_download_gb: 147
 
 # Invariants on the online set after a load. max_online + on_conflict: swap unloads only same-group
 # members; without swap the load is refused. requires_online_below: while any member of `group` is

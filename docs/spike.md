@@ -157,3 +157,41 @@ colab ssh -s localmodels -- bash -lc 'python3 -m venv /content/fv && /content/fv
 - 隧道重连：杀掉 ssh 进程后，守护进程 1 秒后重开 ssh，3.3 秒后 `/health` 恢复。之前要等 watchdog 发现连不上超过 2 分钟才重连。
 - 客户端断开：让 Inkling 写 8000 token 的长文，客户端 4 秒后放弃。非流式和流式两种请求，GPU 利用率都从 99% 在 5 秒内降到 0，`inflight.requests` 回到 0。修之前，非流式请求断开后引擎会继续生成到结束；流式请求本来就会停。
 - 远端自释放的可行性（没有实现，记下备查）：`google.colab.runtime.unassign()` 只是向环境变量 `TBE_RUNTIME_ADDR` 指向的地址发 `POST /unassign`，不依赖 notebook 前端，所以从 ssh 里也应该能调用。没有实际调用过。
+
+## 11. 第 3 阶段：Qwen 的 Basalt 包和 Pika 加速（2026-11-23）
+
+### 空闲判断漏掉了 ssh 上手动跑的任务
+- 第一次做这一阶段时，G4 在 19:56 被 Mac 上的 watchdog 按"空闲 60 分钟"停掉。当时 FP8 基准和 Qwen 草稿层下载都在跑，但它们是从 ssh 直接启动的，不经过 controller，controller 收不到请求，就把会话当成了空闲。运行时磁盘不保留，Pika 缓存（约 141GB）、下载到一半的草稿层和基准结果都丢了。
+- 修法：controller 在空闲检查时把两种外部任务算作活动。一是 GPU 上不属于任何已加载模型的进程（按 nvidia-smi 的 pid 和各后端的进程树比对）；二是 `/content/lm/holds/` 下有文件，给下载、转换这类不用 GPU 的任务用。`/admin/status` 和 `lm status` 会列出这些任务。`remote/bench/phase3.sh` 的每一步开始时建 hold 文件，结束时删掉。在 A100 上实测：拉取草稿层期间 `external_work` 是 `['hold mtp']`，`idle_seconds` 一直在 30 以内。
+- 另一个坑：从非交互 shell 运行 `lm up` 时，`~/.zshrc` 里的 `HF_TOKEN` 不会加载，token 没送到运行时，之前也没有任何提示。现在 deploy 找不到 token 时会打印警告。
+
+### Qwen 转成 Basalt 包（A100 上完成；转换只用 CPU 和磁盘）
+- 草稿层：`mtp_fetch.py fetch` 加 `verify`，用范围请求只取官方 Qwen3.8 的 MTP 张量，共 4.9GB；另外取 `jesdga/Qwen3.8-Flash-Next-Basalt` 里调好的 `convert/mtp/rt/dense.bin`（111MB）。
+- GGUF：SC117 的 `IQ3_XXS/*` 加 `mmproj-Qwen3.8-Flash-Next-BF16.gguf`。注意 `hf download` 同时给了文件名和 `--include` 时会忽略 `--include`，要分两次下载。
+- 转换 658 秒，输出 74.7GiB（80.2GB）一个文件，17 个段：experts 40.0GiB，gguf（n-gram 表）30.9GiB，dense 1.4GiB，mtp 0.77GiB，vision 0.85GiB。转换器提醒自己转的包"明显慢于官方包"，所以要实测。
+- 原生上下文 262144（GGUF 里的 `qwen4exp.context_length`）。
+- 上传到 `mgresearch/colab-models-basalt`，commit `7f958d1b`，文件名 `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS.basalt`。Xet 去重后实际只传了 10.3GB。
+
+### Qwen：Basalt 和 Strata 在 G4 上对比
+- 下载私有包：controller 的 `hf download` 开着 `HF_XET_HIGH_PERFORMANCE`，HF 的 Xet CDN 两次都在几分钟内返回 429，而且每次都卡在同一个块上；不开高性能模式也一样。失败后半截文件会被删掉，所以重试会从头开始。改成固定 4 个连接（`HF_XET_FIXED_DOWNLOAD_CONCURRENCY=4`）、Xet 自己重试 30 次（`HF_XET_CLIENT_RETRY_MAX_ATTEMPTS=30`）之后，80GB 一次下完。同一时间下载公开的 SC117 GGUF（77GB）没有遇到 429。controller 现在第一次用高性能模式，失败后按这组设置最多再试 3 次。超过大小上限的文件不能关掉 Xet 走普通 HTTP（`hf` 会直接拒绝）。
+- 另一个 bug：模型已经在线时，`lm load qwen --route basalt` 直接回"已在线"，不会切换路线。已修：指定了不同路线时，先确认新路线可用，再停掉旧的、加载新的。
+- 显存：Basalt 加载后 46.0GB，读完 150K token 的提示后 49.6GB；Strata（32K 上下文）53.9GB。
+- 生成速度（同 4 个提示词各跑两轮，`remote/bench/chat_bench.py`）：Basalt 230–410 tok/s，平均约 294；Strata 232–372 tok/s，平均约 289。在误差范围内一样快，没有看到转换器警告的"自己转的包明显更慢"。首 token 都是 0.27–0.5 秒。Strata 两轮的输出逐 token 相同，Basalt 每轮不同。
+- 读长提示（`remote/bench/prefill_bench.py`，开头埋一个口令）：约 24K token，Strata 2.7–2.8 秒；Basalt 第一次 31 秒（像是一次性的预热），第二次 4.1 秒。150K token 只有 Basalt 能跑（Strata 只开了 32K），14.6 秒，口令找回正确。
+- 回答：代码、中文解释、算术（15:35 到达）两边都对。
+- 结论：G4 上 Qwen 默认走 Basalt。好处是 262K 上下文（dsh 的系统提示就有约 23K token）、少用约 8GB 显存、能看图；代价是第一次长提示要预热，包放在私有仓库，下载要 HF_TOKEN。
+
+### Pika：官方 adapter、FP8、常驻显存（G4）
+- 默认改用官方 `fl2va/adapter.safetensors`。它是按 pipeline 自带的 6 步调度蒸馏的；社区 Turbo LoRA 是按 4 步、shift 6 调的，而 diffusers 的 pipeline 只跑自己的 6 步表。之前在 G4 上测过三组（offload，bf16，5 秒）：Turbo LoRA + 6 步 77.4 秒，官方 adapter + 6 步 76.0 秒，Turbo LoRA + 4 步 70.1 秒。速度差不多，所以选两边配套的组合。worker 去掉了 pipeline 根本不认的 `--steps` / `--guidance`，`/jobs` 也不再接受 `steps`。注册表里不再有模型用 `lora` 字段，这套机制已删除。
+- torchao 的 PerRow FP8 只接受 bf16 权重，模型里有非 bf16 的 Linear，直接量化会报错；现在只量化 bf16 的 Linear（`filter_fn`）。
+- 5 秒 480p，种子 42（`remote/bench/pika_bench.py`）：
+
+| 方案 | 热启动每段 | 第一次请求 | 峰值显存 | 加载 |
+|---|---|---|---|---|
+| bf16 + offload（原来的默认） | 78 秒 | 354 秒 | 78.9GB（生成后仍占着） | 很快，权重在第一次请求时才读 |
+| FP8 + 融合 adapter + 全部常驻 | 35–37 秒 | 37 秒 | 77.5GB | 约 400 秒（先读权重再量化） |
+| FP8 + 融合 adapter + offload | 55 秒 | 90 秒 | 45.4GB | 约 500 秒 |
+
+- 画质：第 0、60、120 帧对比（`docs/pika-fp8-frames.png`，上到下：bf16、FP8 常驻、FP8 offload），构图和动作和 bf16 接近，两种 FP8 几乎一样，没看到伪影。
+- 经 controller 端到端（`lm load pika` 后 `lm video`）：加载 539 秒（权重已在磁盘上），5 秒视频 39 秒和 35 秒，10 秒视频 83 秒。10 秒视频之后进程占 87.3GB，注册表按 88GB 估。
+- 结论：sm_89 以上（G4、L4、H100）走 `fp8` 路线：融合、FP8、常驻，快 2.2 倍，而且第一次请求不再等 6 分钟。A100（sm_80）没有 FP8，走 `bf16` 路线（offload）。显存占用和原来差不多，所以 Pika 在 G4 上仍然只能单独在线。

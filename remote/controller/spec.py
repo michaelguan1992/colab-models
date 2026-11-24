@@ -67,13 +67,6 @@ class Engine:
 
 
 @dataclass(frozen=True)
-class Lora:
-    repo: str
-    file: str
-    revision: str | None
-
-
-@dataclass(frozen=True)
 class Route:
     """One way to run a model. ``requires_sm`` and ``caps`` are already merged with the engine / model."""
     name: str
@@ -86,7 +79,6 @@ class Route:
     include: tuple[str, ...]
     revision: str | None
     model_path: str | None
-    lora: Lora | None
     extra: tuple[str, ...]
     params: Mapping[str, str]
     caps: Mapping[str, Any]

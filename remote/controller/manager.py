@@ -203,8 +203,6 @@ class Manager:
 
     async def _hf_refusal(self, route: Route) -> str | None:
         sources = [(route.repo, route.revision)] if route.repo else []
-        if route.lora:
-            sources.append((route.lora.repo, route.lora.revision))
         for repo, revision in sources:
             try:
                 reason = await asyncio.wait_for(asyncio.to_thread(self.hf_check, repo, revision), timeout=30)
@@ -218,7 +216,7 @@ class Manager:
     # ---- disk ------------------------------------------------------------
     def _weight_dirs(self, model_id: str) -> list[Path]:
         base = self.registry.models_dir
-        return [base / model_id, base / f"{model_id}-lora"]
+        return [base / model_id]
 
     def _plan(self, model: ModelSpec, route: Route, snap: gpu_mod.GpuSnapshot, swap: bool) -> Plan:
         target = Spec(model.id, model.group, route.vram_gb)

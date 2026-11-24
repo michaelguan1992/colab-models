@@ -39,10 +39,10 @@ def test_jobs_launch_uses_the_venv_python_and_route_params():
     b, argv = argv_of("pika", Installed(venv_python=Path("/v/bin/python")))
     reg = b.registry
     assert argv[:3] == ["/v/bin/python", "-m", "controller.pika_worker"]
-    pairs = dict(zip(argv[3::2], argv[4::2]))
-    assert pairs == {"--model-dir": str(reg.models_dir / "pika"), "--lora-dir": str(reg.models_dir / "pika-lora"),
-                     "--lora-file": "pika_h3_flex_turbo_4step_fl2va.safetensors", "--workflow": "fl2va",
-                     "--steps": "4", "--guidance": "1.0", "--fps": "24", "--width": "832", "--height": "480",
+    assert argv[-1] == "--cpu-offload"
+    pairs = dict(zip(argv[3:-1:2], argv[4:-1:2]))
+    assert pairs == {"--model-dir": str(reg.models_dir / "pika"), "--adapter-file": "fl2va/adapter.safetensors",
+                     "--workflow": "fl2va", "--fps": "24", "--width": "832", "--height": "480",
                      "--outputs-dir": str(reg.outputs_dir), "--port": "8090"}
 
 
@@ -52,7 +52,7 @@ def test_expand_puts_the_extra_list_in_place_and_leaves_other_braces_alone():
     assert expand(["{extra}", "z"], {}, []) == ["z"]
 
 
-def test_downloads_follow_the_route_including_the_lora(monkeypatch):
+def test_downloads_follow_the_route(monkeypatch):
     seen = []
 
     async def record(self, cmd, env=None):
@@ -62,10 +62,8 @@ def test_downloads_follow_the_route_including_the_lora(monkeypatch):
     monkeypatch.setattr(Backend, "_run_logged", record)
     reg = tmp_registry()
     asyncio.run(build(JobsBackend, "pika", reg).download())
-    base, lora = seen
-    assert base[:3] == ["hf", "download", "Pika-Labs/Pika-H3-Flex"] and base.count("--include") == 10
-    assert lora == ["hf", "download", "Pika-Labs/Pika-H3-Flex-Turbo-LoRA", "--local-dir",
-                    str(reg.models_dir / "pika-lora"), "--include", "pika_h3_flex_turbo_4step_fl2va.safetensors"]
+    [base] = seen
+    assert base[:3] == ["hf", "download", "Pika-Labs/Pika-H3-Flex"] and "fl2va/*" in base
     seen.clear()
     asyncio.run(build(ServerBackend, "qwen-tiny", reg).download())
     assert seen == [["hf", "download", "Qwen/Qwen3-0.6B-GGUF", "--local-dir", str(reg.models_dir / "qwen-tiny"),

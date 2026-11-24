@@ -38,7 +38,6 @@ class Backend:
         self.started_at: float | None = None
         self.ready_at: float | None = None
         self.local_dir: Path = registry.models_dir / model.id
-        self.lora_dir: Path = registry.models_dir / f"{model.id}-lora"
         self.log_path: Path = registry.logs_dir / f"{model.id}.log"
         self.upstream_model: str | None = None
         self.health_failures = 0
@@ -62,8 +61,6 @@ class Backend:
         v["model_dir"] = str(self.local_dir)
         if r.model_path:
             v["model_path"] = str(self.local_dir / r.model_path)
-        if r.lora:
-            v.update(lora_dir=str(self.lora_dir), lora_file=r.lora.file)
         return v
 
     # ---- lifecycle -------------------------------------------------------
@@ -152,8 +149,6 @@ class Backend:
     async def download(self) -> None:
         r = self.route
         await self._hf_download(r.repo, list(r.include) or None, self.local_dir, r.revision)
-        if r.lora:
-            await self._hf_download(r.lora.repo, [r.lora.file], self.lora_dir, r.lora.revision)
 
     def download_progress(self) -> float | None:
         est = self.route.est_download_gb

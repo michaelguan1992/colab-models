@@ -98,13 +98,12 @@ BAD = [
     ("extra must stand alone", lambda r: r["engines"]["strata"].update(
         launch=["{bin}", "--x={extra}"]), "{extra}"),
     ("launch placeholder nobody provides", lambda r: r["engines"]["llama-cpp"]["launch"].append("{nope}"), "nope"),
-    ("launch needs a param the route lacks", lambda r: r["models"]["pika"]["routes"][0]["params"].pop("steps"),
-     "steps"),
+    ("launch needs a param the route lacks", lambda r: r["models"]["pika"]["routes"][0]["params"].pop("adapter_file"),
+     "adapter_file"),
     ("stop placeholder nobody provides", lambda r: r["engines"]["strata"]["stop"].append("{model_path}"),
      "model_path"),
     ("model_path placeholder without model_path", lambda r: r["models"]["qwen-tiny"]["routes"][0].pop("model_path"),
      "model_path"),
-    ("lora placeholders without a lora", lambda r: r["models"]["pika"]["routes"][0].pop("lora"), "lora"),
     ("extra with no {extra} in launch", lambda r: r["engines"]["llama-cpp"].update(
         launch=["{bin}", "-m", "{model_path}", "--port", "{port}"]), "extra"),
     ("param shadows a builtin", lambda r: r["models"]["pika"]["routes"][0]["params"].update(port=1), "port"),
@@ -138,7 +137,7 @@ def test_engine_and_route_sm_requirements_merge():
     raw["models"]["inkling"]["routes"][0]["requires"] = {"sm": [120, 80]}
     reg = Registry(raw)
     assert reg.routes("inkling")[0].requires_sm == (120,)
-    assert reg.routes("qwen")[0].requires_sm == (120, 100)
+    assert reg.routes("qwen")[-1].requires_sm == (120, 100)  # the strata route
 
 
 def test_parse_sm():
@@ -175,7 +174,7 @@ def test_load_picks_route_by_gpu_and_status_shows_it():
     client, mgr = make_client(registry=tmp_registry(two_route_raw()), compute_cap="12.0")
     with client:
         models = {m["id"]: m for m in client.get("/admin/status").json()["models"]}
-        assert models["inkling"]["route"] == "fast" and models["pika"]["route"] == "diffusers"
+        assert models["inkling"]["route"] == "fast" and models["pika"]["route"] == "fp8"
         assert client.post("/admin/load", json={"id": "inkling"}).status_code == 200
         wait_ready(client, "inkling")
         assert mgr.backends["inkling"].route.name == "fast"
@@ -208,3 +207,10 @@ def test_shipped_registry_prefers_basalt_on_blackwell_and_strata_elsewhere():
     assert reg.choose("inkling", "12.0").route.engine == "basalt"
     assert reg.choose("inkling", "8.9").route.engine == "strata"
     assert reg.choose("inkling", "8.0").route.engine == "strata"
+
+
+def test_pika_runs_fp8_only_where_the_gpu_has_fp8():
+    reg = Registry(copy.deepcopy(RAW))
+    assert reg.choose("pika", "12.0").route.name == "fp8" and reg.choose("pika", "8.9").route.name == "fp8"
+    assert reg.choose("pika", "8.0").route.name == "bf16"  # A100
+    assert "--cpu-offload" in reg.choose("pika", "8.0").route.extra

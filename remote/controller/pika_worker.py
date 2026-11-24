@@ -1,8 +1,8 @@
 """Pika-H3-Flex video worker (separate process so its VRAM is attributable and killable).
 
-Pipeline code follows the Pika-H3-Flex model card (diffusers ModularPipeline). The card's
-own snippets are inconsistent about LoRA loading, so the exact calls are marked
-``spike`` and must be confirmed on the G4 runtime (docs/spike.md).
+Pipeline code follows the Pika-H3-Flex model card (diffusers ModularPipeline). The pipeline's
+own schedule (``denoising_step_list``) decides the step count; ``num_inference_steps`` and
+``guidance_scale`` are ignored by it, so the worker does not take them.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ class GenReq(BaseModel):
     height: int | None = None         # None = the worker's --height
     width: int | None = None          # None = the worker's --width
     seconds: float = Field(5, ge=5, le=15)  # Pika-H3-Flex only accepts 5-15 s clips
-    steps: int | None = None
     seed: int | None = None
 
 
@@ -55,8 +54,24 @@ class Worker:
             pipe = ModularPipeline.from_pretrained(a.model_dir, components_manager=manager)
             pipe.load_components(workflow=a.workflow,
                                  dtype={"vae": torch.float32, "audio_vae": torch.float32, "default": torch.bfloat16})
-            # spike: Turbo LoRA is pre-fused with the Flex adapter, so load it instead of fl2va/adapter.
-            pipe.load_lora_weights(a.lora_dir, weight_name=a.lora_file)
+            pipe.load_lora_weights(a.adapter_dir or a.model_dir, weight_name=a.adapter_file)
+            if a.fuse:
+                pipe.fuse_lora()
+                pipe.unload_lora_weights()
+            if a.fp8:  # only measured on fused weights; an unfused LoRA would wrap the Linear layers torchao swaps
+                from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, PerRow, quantize_
+
+                def bf16_linear(m, _fqn):  # PerRow FP8 rejects the model's non-bf16 Linear layers
+                    return isinstance(m, torch.nn.Linear) and m.weight.dtype == torch.bfloat16
+
+                cfg = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
+                quantize_(pipe.transformer, cfg, filter_fn=bf16_linear)
+                if a.fp8_text:
+                    quantize_(pipe.text_encoder, cfg, filter_fn=bf16_linear)
+            if a.step_list:
+                pipe.register_to_config(denoising_step_list=[int(t) for t in a.step_list.split(",")])
+            if a.video_shift is not None:
+                pipe.scheduler.register_to_config(shift=a.video_shift)
             if not a.cpu_offload:
                 pipe.to("cuda")
             self.pipe = pipe
@@ -82,7 +97,6 @@ class Worker:
 
         kwargs = dict(prompt=req.prompt, height=req.height or self.args.height, width=req.width or self.args.width,
                       num_frames=round(req.seconds * self.args.fps) + 1,
-                      num_inference_steps=req.steps or self.args.steps, guidance_scale=self.args.guidance,
                       output=["videos", "audio", "sampling_rate"])
         if req.image_b64:
             from PIL import Image
@@ -99,11 +113,14 @@ class Worker:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--model-dir", required=True)
-    p.add_argument("--lora-dir", required=True)
-    p.add_argument("--lora-file", required=True)
+    p.add_argument("--adapter-dir", help="directory holding --adapter-file; default --model-dir")
+    p.add_argument("--adapter-file", required=True, help="e.g. fl2va/adapter.safetensors")
     p.add_argument("--workflow", default="fl2va")
-    p.add_argument("--steps", type=int, default=4)
-    p.add_argument("--guidance", type=float, default=1.0)
+    p.add_argument("--step-list", help="comma-separated timesteps replacing the pipeline's denoising_step_list")
+    p.add_argument("--video-shift", type=float, help="video scheduler shift (the pipeline default is 12)")
+    p.add_argument("--fuse", action="store_true", help="fuse the adapter into the weights")
+    p.add_argument("--fp8", action="store_true", help="FP8 transformer (torchao); requires --fuse")
+    p.add_argument("--fp8-text", action="store_true", help="also FP8 the text encoder")
     p.add_argument("--fps", type=int, default=24)
     p.add_argument("--width", type=int, default=832)
     p.add_argument("--height", type=int, default=480)
@@ -111,6 +128,8 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8090)
     p.add_argument("--cpu-offload", action="store_true")
     args = p.parse_args()
+    if args.fp8 and not args.fuse:
+        p.error("--fp8 needs --fuse")
 
     w = Worker(args)
     threading.Thread(target=w.load, daemon=True).start()

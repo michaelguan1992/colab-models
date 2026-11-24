@@ -505,12 +505,12 @@ def test_gated_repo_refuses_before_touching_anything():
         assert calls == ["AtomicChat/Inkling-2-Mini-Uncensored-GGUF"]
 
 
-def test_pika_checks_both_the_model_and_lora_repos():
+def test_pika_checks_its_model_repo():
     calls = []
     client, _ = make_client(hf_check=lambda repo, rev: calls.append(repo))
     with client:
         assert client.post("/admin/load", json={"id": "pika"}).json()["ok"]
-    assert calls == ["Pika-Labs/Pika-H3-Flex", "Pika-Labs/Pika-H3-Flex-Turbo-LoRA"]
+    assert calls == ["Pika-Labs/Pika-H3-Flex"]
 
 
 def test_hf_check_crash_proceeds_with_the_load():
