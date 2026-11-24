@@ -1,61 +1,94 @@
-# LocalModels：Colab G4 上的自托管模型，一键启停
+# LocalModels
 
-在 Google Colab G4 运行时（RTX PRO 6000，96GB）上跑模型，在 Mac 上用 DeepSeek Harness（dsh）调用。
+Run your own models on a Google Colab GPU and use them from a Mac, starting and stopping everything with one command.
 
-| id | 模型 | 引擎 | 显存估计 |
+[中文说明](README.zh-CN.md)
+
+The target runtime is a Colab G4 (RTX PRO 6000 Blackwell, 96GB). A100 80GB and smaller GPUs work too, with fallback routes. On the Mac, the `lm` CLI creates the Colab session, deploys a controller and opens an ssh tunnel. You then use the models from DeepSeek Harness (dsh), Claude Code or any OpenAI-compatible client.
+
+## Models
+
+| id | Model | Engine | VRAM |
 |---|---|---|---|
-| `inkling` | G4：OpenUncensored/Inkling-2-Mini-Uncensored（Basalt 包，1M 上下文）；其他 GPU：AtomicChat GGUF（Q4_K，32K） | Basalt / Strata | ~55GB / ~18GB |
-| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF（IQ3_XXS）。G4：转成 Basalt 包（262K 上下文，能看图）；其他 GPU：GGUF（32K） | Basalt / Strata | ~50GB / ~54GB |
-| `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF（Q8_0，演示用） | llama.cpp | ~2GB |
-| `pika` | Pika-H3-Flex + 官方 fl2va adapter（6 步，**视频+音频**）；G4 上 FP8、常驻显存，5 秒视频约 36 秒 | diffusers | ~78GB |
-| `moss` | OpenMOSS-Team/MOSS-Image-SFT + lodestones 8 步 LoRA（CFG 1，**图像**）；A100/H100/G4 常驻显存，其他 GPU 分批放进显存（offload）。L4 上 1024px 每张约 44 秒 | diffusers（自带 pipeline） | ~32GB（估计，G4 未实测） |
+| `inkling` | G4: OpenUncensored/Inkling-2-Mini-Uncensored as a Basalt pack (1M context). Other GPUs: the AtomicChat GGUF (Q4_K, 32K) | Basalt / Strata | ~55GB / ~18GB |
+| `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF (IQ3_XXS). G4: converted to a Basalt pack (262K context, vision). Other GPUs: the GGUF (32K) | Basalt / Strata | ~50GB / ~54GB |
+| `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF (Q8_0, for demos) | llama.cpp | ~2GB |
+| `pika` | Pika-H3-Flex with the official fl2va adapter (6 steps, **video and audio**). On the G4 it runs in FP8, fully resident: about 36 s for a 5 s clip | diffusers | ~78GB |
+| `moss` | OpenMOSS-Team/MOSS-Image-SFT with lodestones' 8-step LoRA (CFG 1, **images**). Resident on A100/H100/G4, CPU offload elsewhere. About 44 s per 1024px image on an L4 | diffusers (model's own pipeline) | ~32GB (estimate, not measured on the G4) |
 
-**调度规则**（写在 `remote/models.yaml` 的 `rules`，由 controller 对"加载之后的在线集合"强制执行，`remote/controller/policy.py`）
-1. 同一时间最多一个 `llm` 组的模型在线（`max_online: 1, on_conflict: swap`）。加载另一个时，会先把同组当前的卸载掉。
-2. 只有在线 `llm` 组模型的**实测**显存低于 22GB 时，`video` 组的 `pika` 才能上线（`requires_online_below`）。在 G4 上 Inkling 走 Basalt、开 1M 上下文，实测 54.7GB，所以 Pika 只能单独在线（演示用的 qwen-tiny 除外）。
-   `image` 组的 `moss` 没有额外规则，只受始终生效的显存检查约束：在 G4 上它能和任一 LLM 同时在线，但不能和 Pika 同时在线。
-3. 45 分钟没有请求，自动卸载所有模型（`idle_unload_minutes`）。
-   在运行时上手动跑的任务也算活动，不会被当成空闲：GPU 上有不属于任何已加载模型的进程，或 `/content/lm/holds/` 里有文件（给转换、下载这类不用 GPU 的任务用，跑完删掉）。`lm status` 会列出这些外部任务。
+Models are declared in [`remote/models.yaml`](remote/models.yaml). Each model has one or more routes, and the controller picks the first route whose GPU requirement matches. Adding a model or an engine only touches that file.
 
-## 一次性准备
+## Scheduling rules
+
+The rules live in the `rules` section of `remote/models.yaml`. The controller checks them against the set of models that would be online after a load ([`policy.py`](remote/controller/policy.py)).
+
+1. **One LLM at a time.** At most one model of the `llm` group is online (`max_online: 1, on_conflict: swap`). Loading another LLM unloads the current one first.
+2. **Pika needs a small LLM.** `pika` (group `video`) loads only while the online LLM's *measured* VRAM is under 22GB (`requires_online_below`). On the G4, Inkling on Basalt with 1M context measures 54.7GB, so Pika runs alone (or next to the `qwen-tiny` demo model).
+   `moss` (group `image`) has no rule of its own. Only the VRAM check applies: online models plus the new one must fit in total VRAM minus a margin. On the G4 that lets it share with either LLM, but not with Pika.
+3. **Idle unload.** After 45 minutes without requests, all models are unloaded (`idle_unload_minutes`).
+   Work you start by hand on the runtime counts as activity. That means a GPU process that belongs to no loaded model, or any file in `/content/lm/holds/`. Use a hold file for CPU or network work such as conversions and downloads, and delete it when done. `lm status` lists this external work.
+
+## Setup (once)
+
+Install the Colab CLI, then authorize it in the browser when prompted:
+
 ```bash
-uv tool install google-colab-cli      # 然后按提示在浏览器里授权
+uv tool install google-colab-cli
 ```
+
+Install the `lm` command from this repository:
+
 ```bash
-uv tool install -e .                  # 在本仓库里执行，安装 lm 命令
+uv tool install -e .
 ```
-接入 harness。先运行 `lm up`，配置会按 controller 报告的模型和能力生成，不在 Mac 上手写：
-- dsh：`lm connect dsh`。它合并写入 `~/.dsh/profiles/web/cordis.patch.yml` 两样东西。一是 provider `colab`，模型、上下文、思考档位、能否看图都来自 `caps`。二是 MCP server `lm`。写之前会备份，只留最近一份。换了 GPU 或改了 `models.yaml` 之后重跑一次。
-- Claude Code：`lm claude`，其余参数原样传给 `claude`，如 `lm claude -p "hi"`。它把 `ANTHROPIC_BASE_URL` 指向 controller，把所有模型别名指向 `default_model`，按 caps 设置上下文窗口，并用 `--mcp-config` 挂上 `lm mcp`。它不改你的 Claude Code 全局设置。`claude` 不在 PATH 上时，在配置里设 `claude_bin`。`lm connect claude-code` 只打印这些环境变量。
-- 其他 OpenAI 客户端（Open WebUI、Continue、Cursor 等）：`lm connect openai` 打印 Base URL 和模型 id。
 
-第一次在真实 G4 上运行时，按 [docs/spike.md](docs/spike.md) 逐项核对。
+Connect a client. Run `lm up` first: client configs are generated from the models and capabilities the controller reports, not written by hand.
 
-## 日常使用
+- **dsh:** `lm connect dsh` merges two things into `~/.dsh/profiles/web/cordis.patch.yml`. One is the provider `colab`, whose models, context length, reasoning levels and vision support come from the controller's `caps`. The other is the MCP server `lm`. The file is backed up first, and only the latest backup is kept. Run it again after switching GPUs or editing `models.yaml`.
+- **Claude Code:** `lm claude` starts `claude` and passes any other arguments through, for example `lm claude -p "hi"`. It points `ANTHROPIC_BASE_URL` at the controller, maps every model alias to `default_model`, sets the context window from `caps` and attaches `lm mcp` with `--mcp-config`. It does not change your global Claude Code settings. If `claude` is not on your PATH, set `claude_bin` in the config. `lm connect claude-code` only prints the environment variables.
+- **Other OpenAI clients** (Open WebUI, Continue, Cursor and so on): `lm connect openai` prints the base URL and model ids.
+
+On a first run on a real G4, check each item in [docs/spike.md](docs/spike.md) (in Chinese).
+
+## Daily use
+
+Start a session, deploy, open the tunnel and load `inkling` (`lm up qwen` loads Qwen instead):
+
 ```bash
-lm up            # 开机 + 部署 + 隧道 + 加载 inkling（lm up qwen 则加载 Qwen）
+lm up
 ```
+
+Unload models, close the tunnel and stop the Colab session, which stops billing:
+
 ```bash
-lm down          # 卸载模型 + 关闭隧道 + 停止 Colab 会话（停止计费）
+lm down
 ```
-### 分不到 GPU 时
-G4 经常返回 503（没有空闲容量，不是账号问题）。`lm up` 按 `accelerators` 顺序每种只申请一次：先 G4，再 A100 80GB（high-mem）。都没有就退出。
-- `lm up --wait [分钟]`：每隔约 `assign_retry_minutes`（默认 12 分钟，±20% 随机）再申请一轮。给了分钟数就最多等这么久（如 `lm up --wait 120`），不给则一直等到当天的 `assign_daily_limit`。
-- 每天最多发 `assign_daily_limit`（默认 12）次申请，多次运行 `lm up` 共用这个额度。短时间内大量重试曾导致别的账号被限制（colabtools#6206）。
-- 分到的显存小于 `min_vram_gb`（默认 75）就立刻停掉，换下一种。
-- 在 A100 80GB 上，Inkling 和 Pika 不能同时在线（始终生效的显存检查：在线模型加目标模型的显存，不能超过 GPU 总显存减余量）。
 
-### 计费与自动关机
-- controller 空闲 `idle_unload_minutes`（45）分钟后只卸载模型，Colab 会话仍按小时计费（G4 约 8.9 计算单元/小时）。
-- `lm up` 会在 Mac 上起一个 watchdog，空闲 `idle_stop_minutes`（默认 60）分钟后自动 `lm down`。日志在 `~/.local/state/lm/watchdog.log`。
-- Mac 睡眠时 watchdog 不运行，所以离开前最好手动 `lm down`。
-- dsh 轮询模型列表不算活动，不会让会话一直开着。
+### When no GPU is available
 
-### 断线
-- 隧道由一个守护进程看着。ssh 退出（断网、换 Wi-Fi、Mac 睡醒）后，它 1 秒后重连，连不上就把间隔逐次加倍，最长 30 秒。链路悄悄断掉时，ssh 约 30 秒内就能发现。日志在 `~/.local/state/lm/tunnel.log`。
-- 客户端中途断开（关掉对话、按停止、超时）时，controller 会立刻断开到引擎的连接，GPU 不会继续生成没人要的回答。流式和非流式请求都是这样。
+The G4 often answers 503. That means no free capacity, not a problem with your account. `lm up` asks once for each entry in `accelerators`, in order: G4 first, then A100 80GB (high-mem). If none is free, it exits.
 
-### 配置（`~/.config/lm/config.toml`，都是可选项）
+- `lm up --wait [minutes]` asks again every `assign_retry_minutes` (default 12, ±20% jitter). With a number, it gives up after that many minutes (for example `lm up --wait 120`). Without one, it keeps trying until the day's `assign_daily_limit`.
+- At most `assign_daily_limit` (default 12) requests are sent per day, shared by every `lm up` run. Rapid retries have gotten other accounts restricted (colabtools#6206).
+- A GPU with less than `min_vram_gb` (default 75) of VRAM is stopped at once, and the next accelerator is tried.
+- On an A100 80GB, Inkling and Pika cannot be online together, because of the VRAM check.
+
+### Billing and auto-stop
+
+- When the controller has been idle for `idle_unload_minutes` (45), it unloads the models only. The Colab session keeps billing by the hour (about 8.9 compute units per hour on the G4).
+- `lm up` also starts a watchdog on the Mac that runs `lm down` after `idle_stop_minutes` (default 60) of idleness. Its log is `~/.local/state/lm/watchdog.log`.
+- The watchdog does not run while the Mac sleeps, so run `lm down` yourself before you leave.
+- dsh polling the model list does not count as activity and will not keep the session alive.
+
+### Disconnects
+
+- A supervisor process watches the tunnel. When ssh exits (network loss, a Wi-Fi change, the Mac waking up), it reconnects after 1 second. If that fails, it doubles the delay each time, up to 30 seconds. ssh notices a silently dead link within about 30 seconds. The log is `~/.local/state/lm/tunnel.log`.
+- When a client disconnects mid-request (a closed chat, a stop button, a timeout), the controller drops the engine connection immediately, so the GPU does not keep generating an answer nobody will read. This holds for streaming and non-streaming requests.
+
+### Configuration
+
+All keys in `~/.config/lm/config.toml` are optional:
+
 ```toml
 accelerators = [{gpu = "G4"}, {gpu = "A100", high_mem = true}]
 min_vram_gb = 75
@@ -65,30 +98,52 @@ idle_stop_minutes = 60
 default_model = "inkling"
 ```
 
-其他命令：`lm status [--usage]`、`lm load <id>`、`lm unload [id]`、`lm video "提示词" [--seconds 5到15] [--image 首帧.png]`、`lm image "提示词" [--width 1024 --height 1024] [--seed N]`、`lm tunnel`、`lm logs [controller|inkling|qwen|pika|moss]`、`lm dsh`、`lm mcp`。
+### Commands
 
-### 请求怎么路由
-- 请求里的 `model` 是哪个在线模型的 id，就发给哪个。模型不在线或不存在时返回 404 并列出在线的模型，不会悄悄换成别的模型。只有一个聊天模型在线时，`model` 可以留空或写 `default`。
-- `/v1/messages`（Anthropic 协议）直通给声明了 `anthropic` 的引擎（Basalt、Strata）。llama.cpp 这类引擎会返回明确的错误。
-- 视频、图片这类任务走 `POST /jobs {"model": "pika", "input": {"prompt": "...", "seconds": 5}}`；也可以不写 `model`，改写 `"serves": "video"` 或 `"image"`，由 controller 挑选在线的对应模型，用 `GET /jobs/{id}` 查状态，结果在 `/files/`。帧数由 worker 按自己的 fps 计算，5 到 15 秒以外的时长会被拒绝。
+| Command | What it does |
+|---|---|
+| `lm status [--usage]` | GPU, online models and their VRAM, idle time; `--usage` adds the compute unit balance |
+| `lm load <id>` / `lm unload [id]` | Load a model (an LLM replaces the current LLM) / unload one, or all |
+| `lm video "prompt" [--seconds 5-15] [--image first-frame.png]` | Generate a video with Pika and download it |
+| `lm image "prompt" [--width 1024 --height 1024] [--seed N]` | Generate an image with MOSS-Image and download it |
+| `lm tunnel` | Rebuild the ssh tunnel |
+| `lm logs [controller\|inkling\|qwen\|pika\|moss]` | Show remote logs |
+| `lm connect dsh\|claude-code\|openai` | Generate client config from the controller's model list |
+| `lm claude [args]` | Start Claude Code on the Colab models |
+| `lm dsh` | Start dsh web with the colab plugin |
+| `lm mcp` | Run as a stdio MCP server |
 
-### 给模型用的工具（MCP）
-`lm mcp` 是一个 stdio MCP server，工具有 `status`、`load`、`unload`、`up`、`down`、`generate`。每个工具运行的就是对应的 `lm` 命令。`lm connect dsh` 和 `lm claude` 会自动挂上它。其他支持 MCP 的 harness 把命令配成 `lm mcp` 即可。`generate` 要等视频生成完，所以 dsh 那边的工具超时设成了 30 分钟。
+## How requests are routed
 
-### 在 dsh 里使用
-`lm dsh` 会带上 `dsh/plugin-colab` 插件启动 dsh web。插件只提供斜杠命令 `/up [model]`、`/down`、`/load <id>`、`/unload [id]`、`/status`，每个都直接运行 `lm`。dsh 的模型选择器通过 `/v1/models` 发现模型，这个接口**只列出在线且 `serves: [chat]` 的模型**。如果别的模型（如 Pika）也在线，名字后面会带 `[+pika]`。
+- The `model` field of a request picks the online model with that id. If the model is offline or unknown, the controller returns 404 and lists the online models. It never silently substitutes another model. When only one chat model is online, `model` may be empty or `default`.
+- `/v1/messages` (the Anthropic protocol) is passed straight through to engines that declare `anthropic` (Basalt, Strata). Engines such as llama.cpp return a clear error.
+- Video and image jobs go to `POST /jobs {"model": "pika", "input": {"prompt": "...", "seconds": 5}}`. Instead of `model` you can send `"serves": "video"` or `"image"`, and the controller picks the online model with that capability. Poll `GET /jobs/{id}` for status; results are served under `/files/`. The worker turns seconds into frames at its own fps, and durations outside 5 to 15 seconds are rejected.
 
-## 结构
+## Tools for models (MCP)
+
+`lm mcp` is a stdio MCP server with the tools `status`, `load`, `unload`, `up`, `down`, `generate` (video) and `generate_image`. Each tool runs the matching `lm` command. `lm connect dsh` and `lm claude` attach it automatically; for any other MCP-capable harness, configure the command `lm mcp`. `generate` waits for the video to finish, so the dsh tool timeout is set to 30 minutes.
+
+## Using it in dsh
+
+`lm dsh` starts dsh web with the [`dsh/plugin-colab`](dsh/plugin-colab) plugin. The plugin only adds slash commands, `/up [model]`, `/down`, `/load <id>`, `/unload [id]` and `/status`, and each one runs `lm`. The dsh model picker discovers models through `/v1/models`, which **lists only online models that serve `chat`**. If another model such as Pika is also online, the name carries a `[+pika]` suffix.
+
+## Layout
+
 ```
-src/lm/                Mac 端 CLI（colab CLI 封装、ssh 隧道、命令）
-remote/bootstrap.sh    在 Colab 上安装 controller 依赖并启动它（可重复执行）；引擎在第一次加载用到它的模型时才安装
-remote/models.yaml     注册表：engines（怎么装、怎么起）、models（仓库、路线、caps、显存估计）、rules（调度规则）。加模型或引擎只改它
-remote/controller/     FastAPI :9000 —— /v1 按 model 路由的反向代理、/jobs、/admin、调度规则
-dsh/plugin-colab/      dsh 插件（斜杠命令，调用 lm）
+src/lm/                Mac-side CLI (colab CLI wrapper, ssh tunnel, commands)
+remote/bootstrap.sh    Installs the controller's dependencies on Colab and starts it (safe to rerun).
+                       Engines are installed the first time a model that needs them loads.
+remote/models.yaml     Registry: engines (how to install and launch), models (repos, routes, caps,
+                       VRAM estimates) and rules (scheduling). Adding a model or engine only touches this file.
+remote/controller/     FastAPI on :9000: a /v1 reverse proxy routed by model, /jobs, /admin, scheduling rules
+remote/bench/          Benchmark and conversion scripts behind the numbers in docs/spike.md
+dsh/plugin-colab/      dsh plugin (slash commands that call lm)
 ```
-Mac 和 Colab 之间只走 `ssh -L`（以 `colab ssh --proxy-mode` 作为 ProxyCommand），没有公网入口。
 
-## 测试
+The Mac and Colab talk only over `ssh -L`, with `colab ssh --proxy-mode` as the ProxyCommand. Nothing is exposed to the public internet.
+
+## Tests
+
 ```bash
 uv run pytest
 ```
