@@ -25,6 +25,24 @@ def test_load_passes_route(monkeypatch):
     assert "route" not in sent[1]
 
 
+def test_image_and_video_jobs_ask_for_their_capability(monkeypatch):
+    sent = []
+
+    class R:
+        status_code = 400
+
+        def json(self):
+            return {"detail": "x"}
+    monkeypatch.setattr(cli, "ensure_tunnel", lambda cfg: None)
+    monkeypatch.setattr(cli, "api", lambda cfg, m, p, **kw: sent.append(kw["json"]) or R())
+    cli.cmd_image(Config(), A(prompt="a fox", model=None, height=None, width=768, seed=3))
+    cli.cmd_video(Config(), A(prompt="a fox", model=None, seconds=5, image=None, height=None, width=None, seed=None))
+    cli.cmd_image(Config(), A(prompt="a fox", model="moss", height=None, width=None, seed=None))
+    assert sent == [{"model": None, "serves": "image", "input": {"prompt": "a fox", "width": 768, "seed": 3}},
+                    {"model": None, "serves": "video", "input": {"prompt": "a fox", "seconds": 5}},
+                    {"model": "moss", "serves": None, "input": {"prompt": "a fox"}}]
+
+
 def test_logs_follow_remote_dir(monkeypatch):
     cmds = []
 

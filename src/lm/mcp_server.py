@@ -29,7 +29,7 @@ def _run(*argv: str) -> str:
 
 server = MCPServer(
     "lm", log_level="WARNING",
-    instructions=("Self-hosted models on a Colab GPU. Only one LLM is online at a time; a video model "
+    instructions=("Self-hosted models on a Colab GPU. Only one LLM is online at a time; a video or image model "
                   "may need the LLM unloaded first. Check status before loading."))
 
 
@@ -75,6 +75,17 @@ def generate(prompt: str, seconds: float = 5, image_path: str | None = None, see
         argv += ["--image", image_path]
     if seed is not None:
         argv += ["--seed", str(seed)]
+    return _run(*argv)
+
+
+@server.tool()
+def generate_image(prompt: str, width: int | None = None, height: int | None = None, seed: int | None = None) -> str:
+    """Generate an image (MOSS-Image, 1024x1024 by default; sides are multiples of 16) and save the PNG locally.
+    Needs the image model online. Returns the saved path. Takes under a minute on the G4."""
+    argv = ["image", prompt]
+    for flag, v in (("--width", width), ("--height", height), ("--seed", seed)):
+        if v is not None:
+            argv += [flag, str(v)]
     return _run(*argv)
 
 

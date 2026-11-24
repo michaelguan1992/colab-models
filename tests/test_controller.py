@@ -240,7 +240,7 @@ def test_status_reports_group_serves_caps_and_engine_per_model():
 def test_group_names_mean_nothing_to_the_code():
     raw = raw_registry()
     for m in raw["models"].values():
-        m["group"] = {"llm": "text", "video": "clips"}[m["group"]]
+        m["group"] = {"llm": "text", "video": "clips", "image": "pictures"}[m["group"]]
     raw["rules"] = [{"group": "text", "max_online": 1, "on_conflict": "swap"},
                     {"group": "clips", "requires_online_below": {"group": "text", "vram_gb": 20}}]
     client, _ = make_client(registry=tmp_registry(raw))
@@ -316,6 +316,24 @@ def test_jobs_route_to_the_online_jobs_model_and_remember_the_owner():
         assert hosts == [("clip.invalid", "/generate", b'{"prompt": "x", "seconds": 6}'),
                          ("clip.invalid", "/jobs/j1", b"")]
         assert mgr.backends["clip"].queue_depth == 1
+
+
+def test_jobs_pick_the_online_model_that_serves_the_requested_capability():
+    client, _ = make_client()
+    with client:
+        hosts = []
+
+        def upstream(request):
+            hosts.append(request.url.host)
+            return httpx.Response(200, json={"id": f"j{len(hosts)}", "state": "queued"})
+        client.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        for mid in ("pika", "moss"):
+            client.post("/admin/load", json={"id": mid})
+            wait_ready(client, mid)
+        assert client.post("/jobs", json={"input": {"prompt": "x"}}).status_code == 400
+        assert client.post("/jobs", json={"serves": "image", "input": {"prompt": "x"}}).json()["model"] == "moss"
+        assert client.post("/jobs", json={"serves": "video", "input": {"prompt": "x"}}).json()["model"] == "pika"
+        assert hosts == ["moss.invalid", "pika.invalid"]
 
 
 def test_503_names_the_capability_and_loading_models():

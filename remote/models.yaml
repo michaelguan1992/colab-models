@@ -82,6 +82,17 @@ engines:
              "--outputs-dir", "{outputs_dir}", "--port", "{port}", "{extra}"]
     ready: {path: /health}
 
+  moss-image:
+    shape: jobs
+    install:
+      kind: venv
+      pip: [fastapi, uvicorn, httpx, psutil]   # Colab's own torch and diffusers run the model's custom pipeline
+    launch: ["{venv_python}", "-m", "controller.moss_worker", "--model-dir", "{model_dir}",
+             "--lora-repo", "{lora_repo}", "--lora-file", "{lora_file}", "--lora-revision", "{lora_revision}",
+             "--steps", "{steps}", "--cfg", "{cfg}", "--size", "{size}",
+             "--outputs-dir", "{outputs_dir}", "--port", "{port}", "{extra}"]
+    ready: {path: /health}
+
 # Each model lists `routes` in priority order; the first whose `requires` matches the GPU is used
 # (`/admin/load` can name one). Ports are unique per model; omit `port` to get one assigned (from 8081).
 # `serves` names what the model answers (chat -> /v1/*, video -> /video/*); route `caps` override model `caps`.
@@ -202,6 +213,39 @@ models:
         vram_gb: 66   # G4 with --cpu-offload: peak 64.4GB while generating; offloaded parts stay cached afterwards
         extra: ["--cpu-offload"]
         est_download_gb: 147
+
+  moss:
+    group: image
+    serves: [image]
+    display: MOSS-Image-SFT (8-step LoRA)
+    routes:
+      # SFT weights (transformer 9.7GB, Qwen3.5-9B text encoder 16.0GB, FLUX.2 VAE 0.2GB) plus lodestones'
+      # 8-step DMD LoRA (1.1GB, fetched by the worker). On the L4 with offload: ~44 s per 1024px image against
+      # ~176 s for the official 50 steps at CFG 3, and the closest of the distilled LoRAs to it (docs/spike.md §12).
+      # The 4-step akhaliq/MOSS-Image-SFT-4-steps LoRA saves ~9 s more but garbles small text.
+      # requires: GPUs with room to keep it resident (A100, H100, G4); the L4 (24GB) ran out at VAE decode.
+      - name: resident
+        engine: moss-image
+        requires: {sm: [80, 90, 100, 120]}
+        repo: OpenMOSS-Team/MOSS-Image-SFT
+        revision: f972bd4b4b9e3852133cc5da954d87bc32cd8fb9
+        include: &moss_files [model_index.json, pipeline_moss_image.py, scheduler/*, text_encoder/*, tokenizer/*,
+                              transformer/*, vae/*]
+        params: &moss_params {lora_repo: lodestones/MOSS-Image-SFT-8-steps-dmd, lora_file: lora.safetensors,
+                              lora_revision: f95df83b5e90ae91ea412434b3f9b7f1c8c6314f, steps: 8, cfg: 1, size: 1024}
+        port: 8091
+        vram_gb: 32   # estimate (26GB of bf16 weights plus activations at 1024px); not yet measured on the G4
+        est_download_gb: 27
+      - name: offload
+        engine: moss-image
+        repo: OpenMOSS-Team/MOSS-Image-SFT
+        revision: f972bd4b4b9e3852133cc5da954d87bc32cd8fb9
+        include: *moss_files
+        params: *moss_params
+        port: 8091
+        vram_gb: 20   # L4: the text encoder and transformer take turns on the GPU
+        extra: ["--cpu-offload"]
+        est_download_gb: 27
 
 # Invariants on the online set after a load. max_online + on_conflict: swap unloads only same-group
 # members; without swap the load is refused. requires_online_below: while any member of `group` is

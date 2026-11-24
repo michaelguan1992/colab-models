@@ -38,7 +38,7 @@ STATE_ICON = {"ready": "● 在线", "offline": "○ 离线", "installing": "◐
 
 WATCHDOG_POLL_S = 60
 WATCHDOG_WAKE_GAP_S = 3 * WATCHDOG_POLL_S
-LOCKED_COMMANDS = {"up", "down", "load", "unload", "tunnel", "video", "connect"}
+LOCKED_COMMANDS = {"up", "down", "load", "unload", "tunnel", "video", "image", "connect"}
 
 
 # ---- helpers -------------------------------------------------------------
@@ -421,14 +421,22 @@ def _detail(r: httpx.Response) -> str:
 
 
 def cmd_video(cfg: Config, a) -> int:
-    ensure_tunnel(cfg)
     inp: dict = {"prompt": a.prompt, "seconds": a.seconds}
+    if a.image:
+        inp["image_b64"] = base64.b64encode(Path(a.image).expanduser().read_bytes()).decode()
+    return _run_job(cfg, a, "video", inp)
+
+
+def cmd_image(cfg: Config, a) -> int:
+    return _run_job(cfg, a, "image", {"prompt": a.prompt})
+
+
+def _run_job(cfg: Config, a, serves: str, inp: dict) -> int:
+    ensure_tunnel(cfg)
     for k in ("height", "width", "seed"):
         if getattr(a, k) is not None:
             inp[k] = getattr(a, k)
-    if a.image:
-        inp["image_b64"] = base64.b64encode(Path(a.image).expanduser().read_bytes()).decode()
-    r = api(cfg, "POST", "/jobs", json={"model": a.model, "input": inp})
+    r = api(cfg, "POST", "/jobs", json={"model": a.model, "serves": None if a.model else serves, "input": inp})
     if r.status_code != 200:
         print(f"失败：{_detail(r)}")
         return 1
@@ -568,15 +576,24 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--seconds", type=float, default=5, help="5 到 15 秒")
     s.add_argument("--height", type=int, help="默认由模型决定")
     s.add_argument("--width", type=int, help="默认由模型决定")
-    s.add_argument("--model", help="任务模型 id；只有一个在线时可省略")
+    s.add_argument("--model", help="任务模型 id；默认用在线的视频模型")
     s.add_argument("--seed", type=int)
     s.add_argument("--out")
     s.set_defaults(fn=cmd_video)
 
+    s = sub.add_parser("image", help="用图像模型（MOSS-Image）生成图片并下载到本地")
+    s.add_argument("prompt")
+    s.add_argument("--height", type=int, help="默认 1024，须为 16 的倍数")
+    s.add_argument("--width", type=int, help="默认 1024，须为 16 的倍数")
+    s.add_argument("--model", help="任务模型 id；默认用在线的图像模型")
+    s.add_argument("--seed", type=int)
+    s.add_argument("--out")
+    s.set_defaults(fn=cmd_image)
+
     s = sub.add_parser("tunnel", help="重建 ssh 隧道")
     s.set_defaults(fn=cmd_tunnel)
 
-    s = sub.add_parser("logs", help="查看远端日志（controller / inkling / qwen / pika）")
+    s = sub.add_parser("logs", help="查看远端日志（controller / inkling / qwen / pika / moss）")
     s.add_argument("name", nargs="?")
     s.add_argument("-n", "--lines", type=int, default=80)
     s.set_defaults(fn=cmd_logs)

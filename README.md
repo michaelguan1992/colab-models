@@ -13,6 +13,7 @@
 **调度规则**（写在 `remote/models.yaml` 的 `rules`，由 controller 对"加载之后的在线集合"强制执行，`remote/controller/policy.py`）
 1. 同一时间最多一个 `llm` 组的模型在线（`max_online: 1, on_conflict: swap`）。加载另一个时，会先把同组当前的卸载掉。
 2. 只有在线 `llm` 组模型的**实测**显存低于 22GB 时，`video` 组的 `pika` 才能上线（`requires_online_below`）。在 G4 上 Inkling 走 Basalt、开 1M 上下文，实测 54.7GB，所以 Pika 只能单独在线（演示用的 qwen-tiny 除外）。
+   `image` 组的 `moss` 没有额外规则，只受始终生效的显存检查约束：在 G4 上它能和任一 LLM 同时在线，但不能和 Pika 同时在线。
 3. 45 分钟没有请求，自动卸载所有模型（`idle_unload_minutes`）。
    在运行时上手动跑的任务也算活动，不会被当成空闲：GPU 上有不属于任何已加载模型的进程，或 `/content/lm/holds/` 里有文件（给转换、下载这类不用 GPU 的任务用，跑完删掉）。`lm status` 会列出这些外部任务。
 
@@ -64,12 +65,12 @@ idle_stop_minutes = 60
 default_model = "inkling"
 ```
 
-其他命令：`lm status [--usage]`、`lm load <id>`、`lm unload [id]`、`lm video "提示词" [--seconds 5到15] [--image 首帧.png]`、`lm tunnel`、`lm logs [controller|inkling|qwen|pika]`、`lm dsh`、`lm mcp`。
+其他命令：`lm status [--usage]`、`lm load <id>`、`lm unload [id]`、`lm video "提示词" [--seconds 5到15] [--image 首帧.png]`、`lm image "提示词" [--width 1024 --height 1024] [--seed N]`、`lm tunnel`、`lm logs [controller|inkling|qwen|pika|moss]`、`lm dsh`、`lm mcp`。
 
 ### 请求怎么路由
 - 请求里的 `model` 是哪个在线模型的 id，就发给哪个。模型不在线或不存在时返回 404 并列出在线的模型，不会悄悄换成别的模型。只有一个聊天模型在线时，`model` 可以留空或写 `default`。
 - `/v1/messages`（Anthropic 协议）直通给声明了 `anthropic` 的引擎（Basalt、Strata）。llama.cpp 这类引擎会返回明确的错误。
-- 视频这类任务走 `POST /jobs {"model": "pika", "input": {"prompt": "...", "seconds": 5}}`，用 `GET /jobs/{id}` 查状态，结果在 `/files/`。帧数由 worker 按自己的 fps 计算，5 到 15 秒以外的时长会被拒绝。
+- 视频、图片这类任务走 `POST /jobs {"model": "pika", "input": {"prompt": "...", "seconds": 5}}`；也可以不写 `model`，改写 `"serves": "video"` 或 `"image"`，由 controller 挑选在线的对应模型，用 `GET /jobs/{id}` 查状态，结果在 `/files/`。帧数由 worker 按自己的 fps 计算，5 到 15 秒以外的时长会被拒绝。
 
 ### 给模型用的工具（MCP）
 `lm mcp` 是一个 stdio MCP server，工具有 `status`、`load`、`unload`、`up`、`down`、`generate`。每个工具运行的就是对应的 `lm` 命令。`lm connect dsh` 和 `lm claude` 会自动挂上它。其他支持 MCP 的 harness 把命令配成 `lm mcp` 即可。`generate` 要等视频生成完，所以 dsh 那边的工具超时设成了 30 分钟。

@@ -12,7 +12,7 @@ def test_lm_mcp_speaks_stdio_and_lists_the_lm_tools():
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = {t.name: t for t in (await session.list_tools()).tools}
-                assert set(tools) == {"status", "load", "unload", "up", "down", "generate"}
+                assert set(tools) == {"status", "load", "unload", "up", "down", "generate", "generate_image"}
                 assert "model" in tools["load"].input_schema["required"]
     asyncio.run(asyncio.wait_for(go(), 30))
 

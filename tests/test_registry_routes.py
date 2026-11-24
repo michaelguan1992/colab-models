@@ -27,7 +27,7 @@ def test_shipped_registry_parses_into_typed_data():
     assert [type(reg.engines[n].install) for n in ("strata", "llama-cpp", "diffusers")] == \
         [ScriptInstall, ArchiveInstall, VenvInstall]
     assert {m.id: m.group for m in reg.models.values()} == \
-        {"inkling": "llm", "qwen": "llm", "qwen-tiny": "llm", "pika": "video"}
+        {"inkling": "llm", "qwen": "llm", "qwen-tiny": "llm", "pika": "video", "moss": "image"}
     assert reg.ids_serving("chat") == ["inkling", "qwen", "qwen-tiny"] and reg.ids_serving("video") == ["pika"]
     assert reg.engines["strata"].daemonizes and reg.engines["strata"].ready.identity == "model_path"
     assert reg.engines["diffusers"].shape == "jobs"
@@ -214,3 +214,10 @@ def test_pika_runs_fp8_only_where_the_gpu_has_fp8():
     assert reg.choose("pika", "12.0").route.name == "fp8" and reg.choose("pika", "8.9").route.name == "fp8"
     assert reg.choose("pika", "8.0").route.name == "bf16"  # A100
     assert "--cpu-offload" in reg.choose("pika", "8.0").route.extra
+
+
+def test_moss_stays_resident_only_where_it_fits():
+    reg = Registry(copy.deepcopy(RAW))
+    assert reg.choose("moss", "12.0").route.name == "resident" and reg.choose("moss", "8.0").route.name == "resident"
+    l4 = reg.choose("moss", "8.9").route
+    assert l4.name == "offload" and "--cpu-offload" in l4.extra

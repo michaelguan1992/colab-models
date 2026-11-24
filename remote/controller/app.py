@@ -37,7 +37,8 @@ class LoadReq(BaseModel):
 
 
 class JobReq(BaseModel):
-    model: str | None = None  # None = the only online jobs model
+    model: str | None = None  # None = the only online jobs model (that serves `serves`, when given)
+    serves: str | None = None  # e.g. video, image
     input: dict
 
 
@@ -221,15 +222,17 @@ def create_app(manager: Manager, idle_poll_s: float = 30, autoload: str | None =
     # ---- jobs (video and any other jobs-shaped engine) ----------------------
     job_owner: dict[str, str] = {}  # job id -> model id; job ids come from the workers
 
-    def jobs_target(requested: object) -> Backend:
-        ready = [b for b in manager.backends.values() if b.state == "ready" and b.engine.shape == "jobs"]
+    def jobs_target(requested: object, serves: str | None) -> Backend:
+        def fits(model) -> bool:
+            return serves is None or serves in model.serves
+        ready = [b for b in manager.backends.values() if b.state == "ready" and b.engine.shape == "jobs" and fits(b.model)]
         if requested in (None, "", "default"):
             if len(ready) == 1:
                 return ready[0]
             if ready:
                 raise HTTPException(400, f"有多个任务模型在线（{', '.join(b.id for b in ready)}），请指定 model")
             ids = [m.id for m in manager.registry.models.values()
-                   if any(manager.registry.engines[r.engine].shape == "jobs" for r in m.routes)]
+                   if fits(m) and any(manager.registry.engines[r.engine].shape == "jobs" for r in m.routes)]
             loading = [b.id for b in manager.backends.values() if b.id in ids and b.state in LOADING_STATES]
             if loading:
                 raise HTTPException(503, f"{loading[0]} 正在加载中")
@@ -258,7 +261,7 @@ def create_app(manager: Manager, idle_poll_s: float = 30, autoload: str | None =
     @app.post("/jobs")
     async def submit_job(req: JobReq, request: Request):
         manager.touch()
-        target = jobs_target(req.model)
+        target = jobs_target(req.model, req.serves)
         r, data = await _job_forward(request, target, "POST", "/generate", json.dumps(req.input).encode())
         if r.status_code < 300:
             job_owner[data["id"]] = target.id

@@ -195,3 +195,23 @@ colab ssh -s localmodels -- bash -lc 'python3 -m venv /content/fv && /content/fv
 - 画质：第 0、60、120 帧对比（`docs/pika-fp8-frames.png`，上到下：bf16、FP8 常驻、FP8 offload），构图和动作和 bf16 接近，两种 FP8 几乎一样，没看到伪影。
 - 经 controller 端到端（`lm load pika` 后 `lm video`）：加载 539 秒（权重已在磁盘上），5 秒视频 39 秒和 35 秒，10 秒视频 83 秒。10 秒视频之后进程占 87.3GB，注册表按 88GB 估。
 - 结论：sm_89 以上（G4、L4、H100）走 `fp8` 路线：融合、FP8、常驻，快 2.2 倍，而且第一次请求不再等 6 分钟。A100（sm_80）没有 FP8，走 `bf16` 路线（offload）。显存占用和原来差不多，所以 Pika 在 G4 上仍然只能单独在线。
+
+## 12. MOSS-Image 选型（L4，2026-11-24）
+
+在单独的 L4 会话 `moss` 上做（不需要 G4；A100 和 H100 当时都申请不到）。脚本是 `remote/bench/moss_fetch.sh`、`moss_bench.py`、`moss_runs.sh`。对比图在 `docs/moss/compare-l4.jpg`。
+
+- 底座：`OpenMOSS-Team/MOSS-Image-SFT`。transformer 是 5B（仓库里存 fp32，20.3GB），文本编码器 Qwen3.5-9B（16.8GB），FLUX.2 VAE。用官方 `custom_pipeline="pipeline_moss_image"`，Colab 自带的 diffusers 0.42、transformers 5.22 就够。这个 pipeline 没有 `load_lora_weights`，LoRA 用 kohya 格式的 key 自己包一层，fp32 不合并（作者说蒸馏的增量比 bf16 的舍入误差还小，合并进 bf16 会丢掉）。
+- 4 个提示词（英文菜单、中文招牌"深夜食堂"、带数字的信息图、人像），同一个种子，1024²，L4 上开 `enable_model_cpu_offload`，峰值 15.7GiB。下面的时间去掉了每组第一张（含权重加载）：
+
+| 方案 | 步数 / CFG | 每张 | 质量 |
+|---|---|---|---|
+| base50（官方默认） | 50 / 3.0 | 约 176 秒 | 皮肤质感和光线最自然；但信息图把 38% 画成了 33% |
+| lode8（lodestones `lora.safetensors`） | 8 / 1.0 | 约 44 秒 | 数字对；图例重复了一个 Office；人像最接近 base50 |
+| lode8l（`lora_latest` 0.7） | 8 / 1.0 | 约 44 秒 | 图例出现乱码"Reed" |
+| akh4（akhaliq v2） | 4 / 1.0 | 约 35 秒 | 数字对；小字有乱码（"Fendnea"）；人像更平滑 |
+| akh3（akhaliq 3 步） | 3 / 1.0 | 约 32 秒 | 小字乱码最多，饼图多一道线 |
+
+- 菜单和"深夜食堂"五组都写对了。蒸馏版颜色更暖、更饱和，人像更像图库照片。
+- 4 步只比 8 步快 9 秒，因为 L4 上每张图大约 25 秒花在文本编码器和 DiT 在 CPU 和 GPU 之间来回搬（每步约 2.3 秒）。G4 上全部常驻显存时这部分会没有，步数的差别会更明显，没有实测。
+- FP8 文本编码器加全部常驻：L4 的 22GB 在 VAE 解码时 OOM，没有结果。要在 G4 上再测。
+- 结论：默认用 lode8（8 步，CFG 1，fp32 LoRA 不合并），质量最接近官方 50 步，快约 4 倍（L4、offload）。akh4 可以做快速档。
