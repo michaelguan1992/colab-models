@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 import yaml
 
 from .policy import MaxOnline, RequiresBelow, Rule, Spec
-from .spec import (Archive, ArchiveInstall, Engine, Install, ModelSpec, Ready, Route, ScriptInstall,
+from .spec import (Archive, ArchiveInstall, Engine, Install, ModelSpec, Ready, Route, ScriptInstall, Source,
                    VenvInstall)
 from .templating import EXTRA, INSTALL_PLACEHOLDERS, engine_provides, placeholders, route_provides
 
@@ -24,7 +24,7 @@ PATH_KEYS = {"models_dir", "outputs_dir", "logs_dir", "state_file", "engines_dir
 ENGINE_KEYS = {"shape", "apis", "install", "launch", "stop", "daemonizes", "ready", "requires"}
 MODEL_KEYS = {"group", "serves", "display", "caps", "routes"}
 ROUTE_KEYS = {"name", "engine", "repo", "include", "revision", "model_path", "vram_gb",
-              "est_download_gb", "port", "requires", "caps", "extra", "params", "ready_timeout_s"}
+              "est_download_gb", "port", "requires", "caps", "extra", "params", "ready_timeout_s", "vram_margin_gb", "also"}
 
 
 class RegistryError(ValueError):
@@ -156,7 +156,7 @@ def _parse_engine(name: str, raw: Any) -> Engine:
     stop = _argv(f"{where}.stop", d["stop"]) if "stop" in d else None
     if shape == "jobs" and (daemonizes or stop):
         raise RegistryError(f"{where} 是 jobs 引擎，不支持 daemonizes / stop")
-    r = _keys(f"{where}.ready", d["ready"], {"path", "identity", "field", "equals"}, {"path"})
+    r = _keys(f"{where}.ready", d["ready"], {"path", "identity", "field", "equals", "busy"}, {"path"})
     path = _str(f"{where}.ready.path", r["path"])
     if not path.startswith("/"):
         raise RegistryError(f"{where}.ready.path 必须以 / 开头，得到 {path!r}")
@@ -167,8 +167,11 @@ def _parse_engine(name: str, raw: Any) -> Engine:
         raise RegistryError(f"{where}.ready.field 和 ready.equals 要一起给（且仅 server 引擎）")
     field = _str(f"{where}.ready.field", r["field"]) if "field" in r else None
     equals = _str(f"{where}.ready.equals", r["equals"]) if "equals" in r else None
+    busy = _str(f"{where}.ready.busy", r["busy"]) if "busy" in r else None
+    if busy is not None and (shape != "server" or not busy.startswith("/")):
+        raise RegistryError(f"{where}.ready.busy 必须以 / 开头（且仅 server 引擎），得到 {busy!r}")
     engine = Engine(name, shape, apis, _parse_install(f"{where}.install", d["install"]) if "install" in d else None,
-                    _argv(f"{where}.launch", d["launch"]), stop, daemonizes, Ready(path, identity, field, equals),
+                    _argv(f"{where}.launch", d["launch"]), stop, daemonizes, Ready(path, identity, field, equals, busy),
                     _sm(where, d.get("requires")))
     if engine.stop:
         missing = placeholders(engine.stop) - engine_provides(engine)
@@ -207,6 +210,23 @@ def _route_port(where: str, route: Any) -> int | None:
     return _int(f"{where}.port", route["port"], 1, 65535) if route.get("port") is not None else None
 
 
+def _parse_also(where: str, raw: Any) -> tuple[Source, ...]:
+    if not isinstance(raw, list):
+        raise RegistryError(f"{where} 必须是列表，得到 {raw!r}")
+    out = []
+    for i, item in enumerate(raw):
+        w = f"{where}[{i}]"
+        if not isinstance(item, dict):
+            raise RegistryError(f"{w} 必须是映射，得到 {item!r}")
+        _keys(w, item, {"repo", "include", "revision", "into"}, {"repo", "include"})
+        into = _str(f"{w}.into", item["into"]) if "into" in item else ""
+        if into.startswith("/") or ".." in into.split("/"):
+            raise RegistryError(f"{w}.into 必须是权重目录内的相对路径，得到 {into!r}")
+        out.append(Source(_str(f"{w}.repo", item["repo"]), _strs(f"{w}.include", item["include"]),
+                          _str(f"{w}.revision", item["revision"]) if item.get("revision") else None, into))
+    return tuple(out)
+
+
 def _parse_route(where: str, raw: dict[str, Any], model_caps: Mapping[str, Any], engines: dict[str, Engine],
                  port: int) -> Route:
     _keys(where, raw, ROUTE_KEYS, {"engine", "vram_gb"})
@@ -232,6 +252,9 @@ def _parse_route(where: str, raw: dict[str, Any], model_caps: Mapping[str, Any],
     if include and not repo:
         raise RegistryError(f"{where} 写了 include 但没有 repo")
     est = _num(f"{where}.est_download_gb", raw["est_download_gb"]) if "est_download_gb" in raw else 0.0
+    also = _parse_also(f"{where}.also", raw.get("also", []))
+    if also and not repo:
+        raise RegistryError(f"{where} 写了 also 但没有 repo")
     route = Route(
         name=_str(f"{where}.name", raw["name"]) if "name" in raw else ename, engine=ename,
         vram_gb=_num(f"{where}.vram_gb", raw["vram_gb"], positive=True), est_download_gb=est, port=port,
@@ -240,7 +263,9 @@ def _parse_route(where: str, raw: dict[str, Any], model_caps: Mapping[str, Any],
         model_path=_str(f"{where}.model_path", raw["model_path"]) if "model_path" in raw else None,
         extra=extra, params={k: str(v) for k, v in params.items()},
         caps={**model_caps, **_parse_caps(f"{where}.caps", raw.get("caps"))},
-        ready_timeout_s=_num(f"{where}.ready_timeout_s", raw.get("ready_timeout_s", 1800), positive=True))
+        ready_timeout_s=_num(f"{where}.ready_timeout_s", raw.get("ready_timeout_s", 1800), positive=True),
+        vram_margin_gb=_num(f"{where}.vram_margin_gb", raw["vram_margin_gb"]) if "vram_margin_gb" in raw else None,
+        also=also)
 
     clash = set(route.params) & (engine_provides(engine) | {"model_dir", "extra", "model_path"})
     if clash:

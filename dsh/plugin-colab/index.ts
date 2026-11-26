@@ -1,9 +1,9 @@
 // dsh-plugin-colab: slash commands for the Colab models, run without a model turn.
 //
-//   /up [model]   /down   /load <id>   /unload [id]   /status
+//   /up [model]   /down   /load <id>   /unload [id]   /status   /comfy [model]
 //
 // Each command runs the `lm` CLI, so model ids, state names and rules live in one place.
-// The agent tools (status, load, generate, ...) come from `lm mcp`, which `lm connect dsh`
+// The agent tools (status, load, ...) come from `lm mcp`, which `lm connect dsh`
 // registers with dsh's MCP manager.
 //
 // API surface used (dsh developer preview — re-check on upgrade):
@@ -53,6 +53,20 @@ export function apply(ctx: Context, config: Config) {
   command('down', '卸载所有模型并停止 Colab 会话（停止计费）', () => ['down'])
   command('load', '加载模型；LLM 同时只能一个，会自动替换', (a) => (a[0] ? ['load', a[0], '--no-wait'] : '用法：/load <模型 id>，可用的 id 见 /status'), '<模型 id>')
   command('unload', '卸载模型（不带参数则全部卸载）', (a) => ['unload', ...a.slice(0, 1)], '[模型 id]')
+
+  // Images and video are made in ComfyUI, not through an agent tool: the generation models do not fit
+  // beside the chat model. Loading takes minutes on a fresh runtime, so this runs detached like /up.
+  ctx.commands.register({
+    name: 'comfy',
+    description: '在浏览器里打开 ComfyUI（moss-comfy 生图，pika-comfy 生视频）',
+    input: { hint: '[模型 id]' },
+    handler: async (inv) => {
+      const model = words(inv.rawInput)[0]
+      const child = spawn(config.lmBin, ['comfy', ...(model ? [model] : [])], { detached: true, stdio: 'ignore' })
+      child.unref()
+      return { kind: 'success' as const, text: `正在加载 ${model ?? '默认的 ComfyUI 模型'}，就绪后会自动打开浏览器；进度用 /status 查看。` }
+    },
+  })
 
   ctx.commands.register({
     name: 'up',

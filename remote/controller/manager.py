@@ -202,8 +202,7 @@ class Manager:
         return Plan(False, reason=reason)
 
     async def _hf_refusal(self, route: Route) -> str | None:
-        sources = [(route.repo, route.revision)] if route.repo else []
-        for repo, revision in sources:
+        for repo, revision in ((s.repo, s.revision) for s in route.sources()):
             try:
                 reason = await asyncio.wait_for(asyncio.to_thread(self.hf_check, repo, revision), timeout=30)
             except Exception as e:
@@ -227,7 +226,8 @@ class Manager:
         disk = self._disk_view(model.id, route, unloading)
         return plan_load(target, online, specs, rules, swap=swap, disk=disk,
                          total_gb=snap.total_gb if snap.available else None,
-                         margin_gb=self.registry.vram_margin_gb)
+                         margin_gb=self.registry.vram_margin_gb if route.vram_margin_gb is None
+                         else route.vram_margin_gb)
 
     def _disk_view(self, model_id: str, route: Route, unloading: set[str]) -> DiskView:
         sizes = {m: sum(dir_size(d) for d in self._weight_dirs(m)) for m in self.registry.models}
@@ -348,7 +348,10 @@ class Manager:
         return reasons
 
     async def idle_check(self) -> None:
-        if self.external_work():
+        # Queued jobs count as activity while they run, like external work: a web UI the user drives directly
+        # (ComfyUI) sends the controller no requests, so otherwise the end of a long job finds the idle clock
+        # already past both limits and the runtime is stopped the moment its queue empties.
+        if self.external_work() or self.inflight()["jobs"]:
             self.touch()
             return
         limit = self.registry.idle_unload_minutes * 60
@@ -370,7 +373,8 @@ class Manager:
                 "routes": [r.name for r in model.routes],
             }
             if b:
-                entry.update(route=b.route.name, engine=b.route.engine, caps=dict(b.route.caps),
+                entry.update(route=b.route.name, engine=b.route.engine, port=b.route.port, caps=dict(b.route.caps),
+                             params=dict(b.route.params),
                              est_vram_gb=b.route.vram_gb, vram_gb=b.vram_gb(snap.per_pid_gb), error=b.error)
                 if b.state == "downloading":
                     entry["download_progress"] = b.download_progress()
@@ -379,7 +383,7 @@ class Manager:
             else:
                 choice = self.registry.choose(mid, snap.compute_cap)
                 chosen = choice.route or model.routes[0]
-                entry.update(route=choice.route.name if choice.route else None, engine=chosen.engine,
+                entry.update(route=choice.route.name if choice.route else None, engine=chosen.engine, port=chosen.port,
                              caps=dict(chosen.caps), est_vram_gb=chosen.vram_gb)
                 if choice.route is None:
                     entry["route_reason"] = choice.reason

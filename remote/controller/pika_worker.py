@@ -1,8 +1,10 @@
 """Pika-H3-Flex video worker (separate process so its VRAM is attributable and killable).
 
 Pipeline code follows the Pika-H3-Flex model card (diffusers ModularPipeline). The pipeline's
-own schedule (``denoising_step_list``) decides the step count; ``num_inference_steps`` and
-``guidance_scale`` are ignored by it, so the worker does not take them.
+own schedule (``denoising_step_list``) decides the step count. The checkpoint is guidance-distilled:
+the pipeline has no ``negative_prompt``, ``guidance_scale`` or ``num_inference_steps`` input, so the
+worker does not take them. Reference images and videos need the ref2va workflow (``transformer_ref``
+plus its adapter), which this worker does not load.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from pydantic import BaseModel, Field
 class GenReq(BaseModel):
     prompt: str
     image_b64: str | None = None      # optional first frame (PNG/JPEG, base64)
+    last_image_b64: str | None = None  # optional last frame; alone, the clip is generated up to it
     height: int | None = None         # None = the worker's --height
     width: int | None = None          # None = the worker's --width
     seconds: float = Field(5, ge=5, le=15)  # Pika-H3-Flex only accepts 5-15 s clips
@@ -98,9 +101,11 @@ class Worker:
         kwargs = dict(prompt=req.prompt, height=req.height or self.args.height, width=req.width or self.args.width,
                       num_frames=round(req.seconds * self.args.fps) + 1,
                       output=["videos", "audio", "sampling_rate"])
-        if req.image_b64:
-            from PIL import Image
-            kwargs["image"] = Image.open(io.BytesIO(base64.b64decode(req.image_b64))).convert("RGB")
+        # Either keyframe routes the pipeline to fl2va; with neither it runs t2va on the same components.
+        for key, b64 in (("image", req.image_b64), ("last_image", req.last_image_b64)):
+            if b64:
+                from PIL import Image
+                kwargs[key] = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
         if req.seed is not None:
             kwargs["generator"] = torch.Generator("cuda").manual_seed(req.seed)
         out = self.pipe(**kwargs)

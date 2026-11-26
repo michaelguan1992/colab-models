@@ -41,7 +41,7 @@ def dsh_provider(status: dict, base_url: str) -> dict:
 
 
 def mcp_server(lm_bin: str) -> dict:
-    # generate waits for the clip; dsh's default 60s tool timeout is shorter than one Pika run.
+    # down and unload wait for engines to exit, which can outlast dsh's default 60s tool timeout.
     return {"transport": "stdio", "command": lm_bin, "args": ["mcp"], "toolCallTimeoutMs": 1_800_000}
 
 

@@ -25,6 +25,7 @@ class Config:
     assign_daily_limit: int = 12        # max assignment requests per day across all `lm up` runs
     idle_stop_minutes: float = 60.0     # watchdog runs `lm down` after this long idle; 0 = off
     default_model: str = "inkling"
+    comfy_model: str = "moss-comfy"    # what `lm comfy` opens
     local_port: int = 9000
     remote_port: int = 9000
     remote_dir: str = "/content/lm/app"

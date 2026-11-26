@@ -21,7 +21,8 @@ def engine_provides(engine: Engine) -> set[str]:
     names = {"port", "models_dir", "outputs_dir"}
     if isinstance(engine.install, (ScriptInstall, ArchiveInstall)):
         names.add("bin")
-    if isinstance(engine.install, VenvInstall):
+    if isinstance(engine.install, VenvInstall) or (
+            isinstance(engine.install, ArchiveInstall) and engine.install.requirements):
         names.add("venv_python")
     return names
 

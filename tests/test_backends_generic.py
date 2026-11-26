@@ -70,6 +70,23 @@ def test_downloads_follow_the_route(monkeypatch):
                      "--include", "Qwen3-0.6B-Q8_0.gguf"]]
 
 
+def test_also_sources_download_into_their_own_subfolders(monkeypatch):
+    seen = []
+
+    async def record(self, cmd, env=None):
+        seen.append(cmd)
+
+    from controller.backends.base import Backend
+    monkeypatch.setattr(Backend, "_run_logged", record)
+    reg = tmp_registry()
+    asyncio.run(build(ServerBackend, "sulphur-comfy", reg, compute_cap="8.0").download())
+    root = reg.models_dir / "sulphur-comfy"
+    assert [(c[2], c[4]) for c in seen] == [
+        ("Comfy-Org/MiniMax-H3", str(root)), ("SulphurAI/Sulphur-3", str(root / "diffusion_models")),
+        ("Pika-Labs/Pika-H3-Flex-Turbo-LoRA", str(root / "loras"))]
+    assert seen[1][5:] == ["--revision", "988224b9913740d60ee54b5a53c7a892467edc76", "--include", "s3.safetensors"]
+
+
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -257,3 +274,21 @@ def test_download_gives_up_after_the_last_attempt(monkeypatch):
     b.download_retry_s = 0
     with pytest.raises(RuntimeError):
         asyncio.run(b.download())
+
+
+def test_comfyui_launches_through_the_launcher_and_its_queue_counts_as_work():
+    b, argv = argv_of("moss-comfy", Installed(bin=Path("/e/ComfyUI/main.py"), venv_python=Path("/e/ComfyUI/.venv/bin/python")))
+    assert argv[:9] == ["/e/ComfyUI/.venv/bin/python", "-m", "controller.comfy_launch", "--comfy", "/e/ComfyUI/main.py",
+                        "--model-dir", str(b.registry.models_dir / "moss-comfy"), "--outputs-dir", str(b.registry.outputs_dir)]
+    assert argv[9:11] == ["--port", "8188"] and argv[11:13] == ["--workflow", "image_moss_image_t2i=MOSS 文生图"]
+
+    def handler(request):
+        if request.url.path == "/queue":
+            return httpx.Response(200, json={"queue_running": [[1]], "queue_pending": [[2], [3]]})
+        return httpx.Response(200, json={"system": {}, "devices": []})
+
+    async def go():
+        async with served(handler) as client:
+            assert await b._ready(client)
+    asyncio.run(go())
+    assert b.queue_depth == 3 and b.busy()

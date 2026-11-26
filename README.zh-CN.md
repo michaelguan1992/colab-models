@@ -10,7 +10,7 @@
 
 | id | 模型 | 引擎 | 显存 |
 |---|---|---|---|
-| `inkling` | G4：OpenUncensored/Inkling-2-Mini-Uncensored 的 Basalt 包（1M 上下文）。A100/H100：AtomicChat 的 GGUF（Q4_K，1M）；更小的 GPU：同一个 GGUF，32K | Basalt / Strata | ~55GB / ~36GB（估计）/ ~18GB |
+| `inkling` | G4：OpenUncensored/Inkling-2-Mini-Uncensored 的 Basalt 包（1M 上下文）。A100/H100：AtomicChat 的 GGUF（Q4_K，1M）；L4：同一个 GGUF，256K（估计，未实测）；其他 GPU：32K | Basalt / Strata | ~55GB / ~36GB（估计）/ ~22GB（估计）/ ~18GB |
 | `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF（IQ3_XXS）。G4：转成 Basalt 包。其他 GPU：GGUF 走 Strata。两者都能看图，上下文都是 1M，即用 YaRN 把训练长度 262K 扩到 4 倍，短 prompt 的输出也会因此改变 | Basalt / Strata | ~70GB / ~70GB（1M 下的估计） |
 | `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF（Q8_0，演示用） | llama.cpp | ~2GB |
 | `pika` | Pika-H3-Flex 加官方 fl2va adapter（6 步，**视频加音频**）。G4 上跑 FP8，整个模型常驻显存，5 秒视频约 36 秒 | diffusers | ~78GB |
@@ -104,8 +104,9 @@ default_model = "inkling"
 |---|---|
 | `lm status [--usage]` | GPU、在线模型和显存、空闲时长；`--usage` 同时显示计算单元余额 |
 | `lm load <id>` / `lm unload [id]` | 加载模型（LLM 会替换当前的 LLM）/ 卸载一个或全部 |
-| `lm video "提示词" [--seconds 5到15] [--image 首帧.png]` | 用 Pika 生成视频并下载 |
-| `lm image "提示词" [--width 1024 --height 1024] [--seed N]` | 用 MOSS-Image 生成图片并下载 |
+| `lm video "提示词" [--seconds 5到15] [--image 首帧.png] [--last-image 尾帧.png]` | 用 Pika 生成视频并下载。Pika 不支持反向提示词 |
+| `lm comfy [moss-comfy\|pika-comfy\|sulphur-comfy] [--no-open]` | 在 ComfyUI 里加载模型并在浏览器打开，直接停在官方工作流上，其余存为预设。`moss-comfy`（默认）：文生图、参考图编辑（含反向提示词）、布局框、颜色/深度控制。`pika-comfy`：文生视频、首尾帧、参考图生视频。`sulphur-comfy`：Sulphur-3（MiniMax-H3 的微调），用 Pika Turbo LoRA 跑 4 步；文生视频预设要从工作流面板（W）里打开。隧道重连后重新运行一次 |
+| `lm image "提示词" [--negative "反向提示词"] [--cfg 1到10] [--width 1024 --height 1024] [--seed N]` | 用 MOSS-Image 生成图片并下载。`--negative` 会打开引导（默认 2），耗时约翻倍 |
 | `lm tunnel` | 重建 ssh 隧道 |
 | `lm logs [controller\|inkling\|qwen\|pika\|moss]` | 查看远端日志 |
 | `lm connect dsh\|claude-code\|openai` | 按 controller 的模型列表生成客户端配置 |
@@ -121,7 +122,7 @@ default_model = "inkling"
 
 ## 给模型用的工具（MCP）
 
-`lm mcp` 是一个 stdio MCP server，工具有 `status`、`load`、`unload`、`up`、`down`、`generate`（视频）和 `generate_image`。每个工具运行的就是对应的 `lm` 命令。`lm connect dsh` 和 `lm claude` 会自动挂上它；其他支持 MCP 的 harness 把命令配成 `lm mcp` 即可。`generate` 要等视频生成完，所以 dsh 那边的工具超时设成了 30 分钟。
+`lm mcp` 是一个 stdio MCP server，工具有 `status`、`load`、`unload`、`up` 和 `down`。每个工具运行的就是对应的 `lm` 命令。`lm connect dsh` 和 `lm claude` 会自动挂上它；其他支持 MCP 的 harness 把命令配成 `lm mcp` 即可。它没有生图和生视频的工具：生成都在 ComfyUI 里做（`lm comfy`，dsh 里是 `/comfy`），因为视频模型和聊天模型在 GPU 上放不下同时在线。
 
 ## 在 dsh 里使用
 

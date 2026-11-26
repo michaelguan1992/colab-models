@@ -147,8 +147,8 @@ class Backend:
                 await asyncio.sleep(self.download_retry_s * (attempt + 1))
 
     async def download(self) -> None:
-        r = self.route
-        await self._hf_download(r.repo, list(r.include) or None, self.local_dir, r.revision)
+        for src in self.route.sources():
+            await self._hf_download(src.repo, list(src.include) or None, self.local_dir / src.into, src.revision)
 
     def download_progress(self) -> float | None:
         est = self.route.est_download_gb

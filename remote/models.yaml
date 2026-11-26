@@ -23,7 +23,11 @@ disk_reserve_gb: 10       # keep free on /content; offline models' weights are d
 #     any route `params` key as {name}, and {extra} (the route's `extra` list, as its own element)
 #   daemonizes: the launcher exits and leaves a server behind; find it through the port listener, stop it with `stop`
 #   ready: {path, identity: model_path} polls path; identity checks the served model is this route's model_path
+#     busy: a path answering JSON whose top-level lists are running and queued work (a web UI the user drives
+#     directly sends the controller no requests, so this is what keeps the idle timers off)
+#   an archive install with `requirements` also provides {venv_python} (the venv those requirements went into)
 #   requires: {sm: [...]} limits the GPU compute capability; a route's own `requires` must hold too
+#   a route may set vram_margin_gb to replace the registry-wide margin while it is the one being loaded
 engines:
   strata:
     shape: server
@@ -93,8 +97,24 @@ engines:
              "--outputs-dir", "{outputs_dir}", "--port", "{port}", "{extra}"]
     ready: {path: /health}
 
+  comfyui:
+    # The web UI itself, opened through `lm comfy`; the controller only starts, stops and watches it.
+    # v0.46.3 has MOSS-Image built in (merged 2026-10-16), so no custom nodes. torch comes from Colab.
+    shape: server
+    install:
+      kind: archive
+      url: https://github.com/Comfy-Org/ComfyUI/archive/refs/tags/v0.46.3.tar.gz
+      sha256: 76e459f485e294340d8dc2b96ff26446c00bafa1858482d1d15c455d328c3766
+      bin: main.py
+      requirements: requirements.txt
+    launch: ["{venv_python}", "-m", "controller.comfy_launch", "--comfy", "{bin}", "--model-dir", "{model_dir}",
+             "--outputs-dir", "{outputs_dir}", "--port", "{port}", "{extra}"]
+    ready: {path: /system_stats, busy: /queue}
+
 # Each model lists `routes` in priority order; the first whose `requires` matches the GPU is used
 # (`/admin/load` can name one). Ports are unique per model; omit `port` to get one assigned (from 8081).
+# A route's `also` lists more repos as {repo, revision, include, into}; their files land in the same weights
+# folder under `into`, for models whose parts are published in different places.
 # `serves` names what the model answers (chat -> /v1/*, video -> /video/*); route `caps` override model `caps`.
 models:
   inkling:
@@ -132,7 +152,21 @@ models:
         est_download_gb: 17.2
         caps: {context: 1048576}
         extra: ["--context", "1048576", "--drafting", "auto"]  # no MTP head in this GGUF; DSpark drafter needs llama.cpp
-      # Smaller GPUs (L4 and the like): 32K keeps it at 18.6GB.
+      # L4 (22.5GB): 256K. Estimated, not yet measured on an L4: 18.1GB without the global KV plus 4GB of KV at
+      # 16 KiB/token = 22.1GB, which leaves ~0.4GB. A long prefill may run out of memory; drop to 192K (21.1GB) if so.
+      # vram_margin_gb: 0 because the registry-wide 4GB margin leaves the L4 only 18.5GB.
+      - name: strata-256k
+        engine: strata
+        requires: {sm: [89]}
+        repo: AtomicChat/Inkling-2-Mini-Uncensored-GGUF
+        include: *inkling_gguf
+        model_path: Inkling-2-Mini-Uncensored-AD-Q4_K.gguf
+        vram_gb: 22
+        vram_margin_gb: 0
+        est_download_gb: 17.2
+        caps: {context: 262144}
+        extra: ["--context", "262144", "--drafting", "auto"]
+      # Other GPUs: 32K keeps it at 18.6GB.
       - engine: strata
         repo: AtomicChat/Inkling-2-Mini-Uncensored-GGUF
         include: *inkling_gguf
@@ -270,6 +304,128 @@ models:
         vram_gb: 20   # L4: the text encoder and transformer take turns on the GPU
         extra: ["--cpu-offload"]
         est_download_gb: 27
+
+  moss-comfy:
+    group: image
+    serves: [comfyui]
+    display: MOSS-Image in ComfyUI (official workflows)
+    routes:
+      # Comfy-Org's repackaged files, exactly the ones the official templates name: int8 SFT transformer 5.4GB,
+      # W4A8 Qwen3.5-9B text encoder 7.3GB, small FLUX.2 VAE, plus the edit and color/depth control LoRAs.
+      # The folder is laid out like ComfyUI's models/, so the launcher hands it over as a model path.
+      # `--workflow template=title` saves that official template as a preset in the UI.
+      - engine: comfyui
+        repo: Comfy-Org/MOSS-Image
+        revision: 2929efe3cdd506c0a430bcfca70a9a8d805cc095
+        include: [diffusion_models/moss_image_sft_int8_convrot.safetensors,
+                  text_encoders/qwen3.5_9b_w4a8_gptq.safetensors, vae/flux2-vae_small.safetensors, loras/*]
+        params: {home: image_moss_image_t2i}   # the template `lm comfy` opens the browser on
+        port: 8188
+        vram_gb: 16   # 12.6GB after a 1024px image (25 steps). L4: ~50 s including the first load.
+                      # A100: 24 s first, 10 s warm, 17 s for an edit
+        est_download_gb: 13.6
+        extra: ["--workflow", "image_moss_image_t2i=MOSS 文生图",
+                "--workflow", "image_moss_image_edit=MOSS 参考图编辑",
+                "--workflow", "image_moss_image_t2i_bboxes=MOSS 布局框文生图",
+                "--workflow", "image_moss_image_color_depth_control=MOSS 颜色深度控制"]
+
+  pika-comfy:
+    group: video
+    serves: [comfyui]
+    display: Pika-H3-Flex in ComfyUI (official workflows)
+    routes:
+      # Comfy-Org's repackaged MiniMax-H3 files, exactly the ones the official Pika templates name: pruned int8
+      # FL2VA and Ref2VA transformers (21GB each), NVFP4 Qwen3-VL-32B text encoder 15.7GB, int8 video VAE,
+      # audio VAE, and the two Pika LoRAs. ComfyUI loads what the running workflow needs and swaps the rest out,
+      # so the same files serve both routes; they differ only in how much VRAM the policy sets aside.
+      # FL2VA and Ref2VA need your own images in their Load Image nodes, so the browser opens on text-to-video.
+      - name: resident
+        engine: comfyui
+        requires: {sm: [80, 90, 100, 120]}
+        repo: Comfy-Org/MiniMax-H3
+        revision: 4b53a35191437de05370da548e59aeabe2a5a09a
+        include: &pika_comfy_files
+          - diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
+          - diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
+          - text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+          - vae/minimax_h3_video_vae_int8_convrot.safetensors
+          - vae/minimax_h3_audio_vae_fp32.safetensors
+          - loras/pika_h3_flex_fl2va_v1_bf16.safetensors
+          - loras/pika_h3_flex_ref2va_v1_bf16.safetensors
+        params: &pika_comfy_params {home: video_pika_h3_flex_t2v}
+        port: 8189
+        vram_gb: 44   # A100 80GB: 37.8GB after all three workflows; a 5 s clip at 1344x768 takes 103 s warm (120 s first),
+                      # 131 s first/last frame, 137 s reference
+        est_download_gb: 66
+        extra: &pika_comfy_presets
+          ["--workflow", "video_pika_h3_flex_t2v=Pika 文生视频",
+           "--workflow", "video_pika_h3_flex_fl2va=Pika 首尾帧生视频",
+           "--workflow", "video_pika_h3_flex_ref2va=Pika 参考图生视频"]
+      - name: offload
+        engine: comfyui
+        repo: Comfy-Org/MiniMax-H3
+        revision: 4b53a35191437de05370da548e59aeabe2a5a09a
+        include: *pika_comfy_files
+        params: *pika_comfy_params
+        port: 8189
+        vram_gb: 18   # L4: 19.5GB used, 438 s for the first 5 s clip at 1344x768 (text-to-video, load included)
+        est_download_gb: 66
+        extra: *pika_comfy_presets
+
+  sulphur-comfy:
+    group: video
+    serves: [comfyui]
+    display: Sulphur-3 in ComfyUI
+    routes:
+      # Sulphur-3 is a fine-tune of the pruned FL2VA transformer (bf16, 40.2GB) and nothing else, so the text
+      # encoder and VAEs are Comfy-Org's MiniMax-H3 files. It runs in 4 steps with the Pika Turbo 4-step LoRA
+      # (3.9GB) at the model's own flow shift of 12, chosen after watching the clips over its rank-32 lite file,
+      # the 8-step HD one, shift 6 (what the LoRA's README asks for), lightx2v's Turbo (4 and 8 steps), the
+      # Pika Flex adapter (6) and 20 steps with CFG (docs/spike.md §13).
+      # No official template names these files, so the preset is the Pika text-to-video template with the model,
+      # LoRA, sampler and sigmas swapped; the sigma table is what the simple scheduler gives for 4 steps.
+      # There is no `home`: the browser cannot be sent to a saved preset, only to an official template, and
+      # that one names files this route does not download.
+      - name: resident
+        engine: comfyui
+        requires: {sm: [80, 90, 100, 120]}
+        repo: Comfy-Org/MiniMax-H3
+        revision: 4b53a35191437de05370da548e59aeabe2a5a09a
+        include: &sulphur_base_files
+          - text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors
+          - vae/minimax_h3_video_vae_int8_convrot.safetensors
+          - vae/minimax_h3_audio_vae_fp32.safetensors
+        also:
+          - {repo: SulphurAI/Sulphur-3, revision: 988224b9913740d60ee54b5a53c7a892467edc76,
+             include: [s3.safetensors], into: diffusion_models}
+          - &sulphur_pika_turbo
+            {repo: Pika-Labs/Pika-H3-Flex-Turbo-LoRA, revision: dcacd93a50f714ba1cd61c7ca2cc5f65e9a1ec60,
+             include: [pika_h3_flex_turbo_4step_fl2va.safetensors], into: loras}
+        port: 8190
+        vram_gb: 64   # A100 80GB: peak 63.4GB, 54.4GB held afterwards. A 5 s clip at 1344x768, warm (docs/spike.md §13):
+                      # 83 s on the A100, 46 s on the G4 (20 steps + CFG: 702 s and 406 s)
+        est_download_gb: 63.3
+        extra: ["--workflow", "video_pika_h3_flex_t2v=Sulphur 文生视频（4 步）",
+                "--swap", "minimax_h3_fl2va_pruned_int8_convrot.safetensors=s3.safetensors",
+                "--swap", &sulphur_swap_lora_v "pika_h3_flex_fl2va_v1_bf16.safetensors=pika_h3_flex_turbo_4step_fl2va.safetensors",
+                "--swap", &sulphur_swap_sampler '"lcm"="euler"',
+                "--swap", &sulphur_swap_sigmas "1.0, 0.972973, 0.923077, 0.8, 0.571429, 0.333333, 0.0=1.0, 0.972973, 0.923077, 0.8, 0.0"]
+      # Smaller GPUs: the repo's own 4-bit quantization (11.4GB), shown in the loader as quantized/s3_w4a8.
+      - name: offload
+        engine: comfyui
+        repo: Comfy-Org/MiniMax-H3
+        revision: 4b53a35191437de05370da548e59aeabe2a5a09a
+        include: *sulphur_base_files
+        also:
+          - {repo: SulphurAI/Sulphur-3, revision: 988224b9913740d60ee54b5a53c7a892467edc76,
+             include: [quantized/s3_w4a8.safetensors], into: diffusion_models}
+          - *sulphur_pika_turbo
+        port: 8190
+        vram_gb: 18   # estimate, after pika-comfy's offload route on the L4
+        est_download_gb: 34.5
+        extra: ["--workflow", "video_pika_h3_flex_t2v=Sulphur 文生视频（4 步）",
+                "--swap", "minimax_h3_fl2va_pruned_int8_convrot.safetensors=quantized/s3_w4a8.safetensors",
+                "--swap", *sulphur_swap_lora_v, "--swap", *sulphur_swap_sampler, "--swap", *sulphur_swap_sigmas]
 
 # Invariants on the online set after a load. max_online + on_conflict: swap unloads only same-group
 # members; without swap the load is refused. requires_online_below: while any member of `group` is

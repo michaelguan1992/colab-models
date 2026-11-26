@@ -27,6 +27,9 @@ class GenReq(BaseModel):
     height: int | None = Field(None, ge=256, le=2048, multiple_of=16)  # None = the worker's --size
     width: int | None = Field(None, ge=256, le=2048, multiple_of=16)
     seed: int | None = None
+    # The pipeline only runs its negative branch when guidance is not 1, at two forwards per step.
+    negative_prompt: str | None = None
+    cfg: float | None = Field(None, ge=1, le=10)  # None = --cfg, or --negative-cfg when a negative prompt is given
 
 
 def lora_linear(base, rank: int, scale: float):
@@ -117,8 +120,10 @@ class Worker:
 
         a = self.args
         generator = torch.Generator("cpu").manual_seed(req.seed) if req.seed is not None else None
+        cfg = req.cfg or (a.negative_cfg if req.negative_prompt and a.cfg == 1 else a.cfg)
         image = self.pipe(req.prompt, height=req.height or a.size, width=req.width or a.size,
-                          num_inference_steps=a.steps, guidance_scale=a.cfg, generator=generator).images[0]
+                          num_inference_steps=a.steps, guidance_scale=cfg, negative_prompt=req.negative_prompt or "",
+                          generator=generator).images[0]
         name = f"{job_id}.png"
         image.save(Path(a.outputs_dir) / name)
         return name
@@ -133,6 +138,8 @@ def main() -> None:
     p.add_argument("--lora-strength", type=float, default=1.0)
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--cfg", type=float, default=1.0, help="1 = one forward pass per step (distilled LoRAs)")
+    p.add_argument("--negative-cfg", type=float, default=2.0,
+                   help="guidance for requests with a negative prompt and no cfg of their own, when --cfg is 1")
     p.add_argument("--size", type=int, default=1024)
     p.add_argument("--outputs-dir", default="/content/outputs")
     p.add_argument("--port", type=int, default=8091)

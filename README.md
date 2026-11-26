@@ -10,7 +10,7 @@ The target runtime is a Colab G4 (RTX PRO 6000 Blackwell, 96GB). A100 80GB and s
 
 | id | Model | Engine | VRAM |
 |---|---|---|---|
-| `inkling` | G4: OpenUncensored/Inkling-2-Mini-Uncensored as a Basalt pack (1M context). A100/H100: the AtomicChat GGUF (Q4_K, 1M); smaller GPUs: the same GGUF at 32K | Basalt / Strata | ~55GB / ~36GB (estimate) / ~18GB |
+| `inkling` | G4: OpenUncensored/Inkling-2-Mini-Uncensored as a Basalt pack (1M context). A100/H100: the AtomicChat GGUF (Q4_K, 1M); L4: the same GGUF at 256K (estimate, not measured); other GPUs: 32K | Basalt / Strata | ~55GB / ~36GB (estimate) / ~22GB (estimate) / ~18GB |
 | `qwen` | SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF (IQ3_XXS). G4: converted to a Basalt pack. Other GPUs: the GGUF on Strata. Both read images and run 1M context, 4x the trained 262K through YaRN, which also changes short prompts' output | Basalt / Strata | ~70GB / ~70GB (estimates at 1M) |
 | `qwen-tiny` | Qwen/Qwen3-0.6B-GGUF (Q8_0, for demos) | llama.cpp | ~2GB |
 | `pika` | Pika-H3-Flex with the official fl2va adapter (6 steps, **video and audio**). On the G4 it runs in FP8, fully resident: about 36 s for a 5 s clip | diffusers | ~78GB |
@@ -104,8 +104,9 @@ default_model = "inkling"
 |---|---|
 | `lm status [--usage]` | GPU, online models and their VRAM, idle time; `--usage` adds the compute unit balance |
 | `lm load <id>` / `lm unload [id]` | Load a model (an LLM replaces the current LLM) / unload one, or all |
-| `lm video "prompt" [--seconds 5-15] [--image first-frame.png]` | Generate a video with Pika and download it |
-| `lm image "prompt" [--width 1024 --height 1024] [--seed N]` | Generate an image with MOSS-Image and download it |
+| `lm video "prompt" [--seconds 5-15] [--image first-frame.png] [--last-image last-frame.png]` | Generate a video with Pika and download it. Pika takes no negative prompt |
+| `lm comfy [moss-comfy\|pika-comfy\|sulphur-comfy] [--no-open]` | Load a model in ComfyUI and open it in the browser on its official workflow, with the others saved as presets. `moss-comfy` (default): text-to-image, edit with reference images and a negative prompt, layout boxes, color/depth control. `pika-comfy`: text-to-video, first/last frame, reference images. `sulphur-comfy`: Sulphur-3 (a MiniMax-H3 fine-tune) at 4 steps with the Pika Turbo LoRA; open its text-to-video preset from the workflows panel (W). Run it again after the tunnel reconnects |
+| `lm image "prompt" [--negative "text"] [--cfg 1-10] [--width 1024 --height 1024] [--seed N]` | Generate an image with MOSS-Image and download it. `--negative` turns guidance on (default 2) and takes about twice as long |
 | `lm tunnel` | Rebuild the ssh tunnel |
 | `lm logs [controller\|inkling\|qwen\|pika\|moss]` | Show remote logs |
 | `lm connect dsh\|claude-code\|openai` | Generate client config from the controller's model list |
@@ -121,7 +122,7 @@ default_model = "inkling"
 
 ## Tools for models (MCP)
 
-`lm mcp` is a stdio MCP server with the tools `status`, `load`, `unload`, `up`, `down`, `generate` (video) and `generate_image`. Each tool runs the matching `lm` command. `lm connect dsh` and `lm claude` attach it automatically; for any other MCP-capable harness, configure the command `lm mcp`. `generate` waits for the video to finish, so the dsh tool timeout is set to 30 minutes.
+`lm mcp` is a stdio MCP server with the tools `status`, `load`, `unload`, `up` and `down`. Each tool runs the matching `lm` command. `lm connect dsh` and `lm claude` attach it automatically; for any other MCP-capable harness, configure the command `lm mcp`. It has no image or video tools: generation happens in ComfyUI (`lm comfy`, or `/comfy` in dsh), because a video model and the chat model do not fit on the GPU together.
 
 ## Using it in dsh
 

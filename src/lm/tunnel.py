@@ -98,6 +98,19 @@ def run(cfg: Config, command: str, capture: bool = False,
                           input=input)
 
 
+def forward(cfg: Config, port: int) -> bool:
+    """Forward one more local port to the same port on the runtime, over the master connection.
+
+    Asking again for a forward the master already has succeeds. A reconnect drops it, so callers ask each time.
+    """
+    if not master_alive(cfg):
+        return False
+    spec = f"127.0.0.1:{port}:127.0.0.1:{port}"
+    r = subprocess.run(["ssh", "-S", str(CONTROL_PATH), "-O", "forward", "-L", spec, _host(cfg)],
+                       capture_output=True, text=True)
+    return r.returncode == 0
+
+
 def start(cfg: Config, proxy_command: str, wait_s: float = 60, require_health: bool = True) -> None:
     """Open the tunnel. require_health=False only waits for the ssh master, for use before the
     controller exists (deploy runs over the master).

@@ -27,7 +27,8 @@ def test_shipped_registry_parses_into_typed_data():
     assert [type(reg.engines[n].install) for n in ("strata", "llama-cpp", "diffusers")] == \
         [ScriptInstall, ArchiveInstall, VenvInstall]
     assert {m.id: m.group for m in reg.models.values()} == \
-        {"inkling": "llm", "qwen": "llm", "qwen-tiny": "llm", "pika": "video", "moss": "image"}
+        {"inkling": "llm", "qwen": "llm", "qwen-tiny": "llm", "pika": "video", "moss": "image",
+         "moss-comfy": "image", "pika-comfy": "video", "sulphur-comfy": "video"}
     assert reg.ids_serving("chat") == ["inkling", "qwen", "qwen-tiny"] and reg.ids_serving("video") == ["pika"]
     assert reg.engines["strata"].daemonizes and reg.engines["strata"].ready.identity == "model_path"
     assert reg.engines["diffusers"].shape == "jobs"
@@ -45,9 +46,10 @@ def test_shipped_registry_gives_every_model_one_unique_port():
 
 def test_route_carries_merged_caps_and_params():
     reg = Registry(copy.deepcopy(RAW))
-    r = reg.choose("inkling", "8.9").route
+    r = reg.choose("inkling", "7.5").route
     assert r.caps == {"tools": True, "vision": False, "context": 32768, "reasoning": []}
     assert r.vram_gb == 18 and r.est_download_gb == 17.2 and r.engine == "strata" and r.name == "strata"
+    assert r.vram_margin_gb is None
     assert reg.routes("pika")[0].params["workflow"] == "fl2va"
 
 
@@ -133,11 +135,11 @@ def test_bad_registry_is_rejected_with_a_message_naming_the_field(name, edit, ma
 
 def test_engine_and_route_sm_requirements_merge():
     raw = copy.deepcopy(RAW)
-    raw["engines"]["strata"]["requires"] = {"sm": [120, 100]}
+    raw["engines"]["strata"]["requires"] = {"sm": [120, 100, 89]}
     raw["models"]["inkling"]["routes"][0]["requires"] = {"sm": [120, 80]}
     reg = Registry(raw)
     assert reg.routes("inkling")[0].requires_sm == (120,)
-    assert reg.routes("qwen")[-1].requires_sm == (120, 100)  # the strata route
+    assert reg.routes("qwen")[-1].requires_sm == (120, 100, 89)  # the strata route
 
 
 def test_parse_sm():
@@ -209,16 +211,24 @@ def test_shipped_registry_prefers_basalt_on_blackwell_and_strata_elsewhere():
     assert reg.choose("inkling", "8.0").route.engine == "strata"
 
 
-def test_inkling_gets_1m_on_big_gpus_and_32k_on_small_ones():
+def test_inkling_gets_1m_on_big_gpus_256k_on_the_l4_and_32k_elsewhere():
     reg = Registry(copy.deepcopy(RAW))
-    assert [reg.choose("inkling", cc).route.caps["context"] for cc in ("12.0", "9.0", "8.0", "8.9")] == \
-        [1048576, 1048576, 1048576, 32768]
+    assert [reg.choose("inkling", cc).route.caps["context"] for cc in ("12.0", "9.0", "8.0", "8.9", "7.5")] == \
+        [1048576, 1048576, 1048576, 262144, 32768]
+
+
+def test_l4_route_fits_only_because_it_drops_the_vram_margin():
+    reg = Registry(copy.deepcopy(RAW))
+    r = reg.choose("inkling", "8.9").route
+    assert r.name == "strata-256k" and r.vram_margin_gb == 0
+    l4_gb = 23034 / 1024
+    assert r.vram_gb <= l4_gb - r.vram_margin_gb and r.vram_gb > l4_gb - reg.vram_margin_gb
 
 
 def test_qwen_reads_images_on_every_route_and_inkling_only_on_basalt():
     reg = Registry(copy.deepcopy(RAW))
     assert all(r.caps["vision"] for r in reg.routes("qwen"))
-    assert [r.caps["vision"] for r in reg.routes("inkling")] == [True, False, False]  # Strata refuses Inkling images
+    assert [r.caps["vision"] for r in reg.routes("inkling")] == [True, False, False, False]  # Strata refuses Inkling images
 
 
 def test_pika_runs_fp8_only_where_the_gpu_has_fp8():
@@ -233,3 +243,17 @@ def test_moss_stays_resident_only_where_it_fits():
     assert reg.choose("moss", "12.0").route.name == "resident" and reg.choose("moss", "8.0").route.name == "resident"
     l4 = reg.choose("moss", "8.9").route
     assert l4.name == "offload" and "--cpu-offload" in l4.extra
+
+
+def test_also_needs_a_repo_and_a_path_inside_the_weights_folder():
+    raw = copy.deepcopy(RAW)
+    route = raw["models"]["sulphur-comfy"]["routes"][0]
+    assert [s.repo for s in Registry(copy.deepcopy(raw)).routes("sulphur-comfy")[0].sources()] == \
+        ["Comfy-Org/MiniMax-H3", "SulphurAI/Sulphur-3", "Pika-Labs/Pika-H3-Flex-Turbo-LoRA"]
+    route["also"][0]["into"] = "../elsewhere"
+    with pytest.raises(RegistryError, match="into"):
+        Registry(copy.deepcopy(raw))
+    route["also"][0]["into"] = "diffusion_models"
+    del route["repo"], route["include"], route["revision"]
+    with pytest.raises(RegistryError, match="also"):
+        Registry(raw)

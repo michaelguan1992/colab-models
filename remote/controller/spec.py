@@ -51,6 +51,9 @@ class Ready:
     # equal this value before the model counts as ready.
     field: str | None = None
     equals: str | None = None
+    # A web UI the user drives directly sends the controller no requests. This path answers JSON whose
+    # top-level lists are its running and queued work; their total length keeps the idle timers off.
+    busy: str | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,15 @@ class Engine:
     daemonizes: bool
     ready: Ready
     requires_sm: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class Source:
+    """Files from one HuggingFace repo, placed under ``into`` (relative to the model's weights folder)."""
+    repo: str
+    include: tuple[str, ...]
+    revision: str | None = None
+    into: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +95,12 @@ class Route:
     params: Mapping[str, str]
     caps: Mapping[str, Any]
     ready_timeout_s: float
+    vram_margin_gb: float | None = None   # overrides the registry-wide margin when this route is the load target
+    also: tuple[Source, ...] = ()         # more repos whose files join the same weights folder
+
+    def sources(self) -> tuple[Source, ...]:
+        main = (Source(self.repo, self.include, self.revision),) if self.repo else ()
+        return main + self.also
 
     def fits(self, sm: int | None) -> bool:
         return not self.requires_sm or (sm is not None and sm in self.requires_sm)

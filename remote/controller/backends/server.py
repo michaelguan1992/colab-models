@@ -100,7 +100,16 @@ class ServerBackend(Backend):
                 return False
         if upstream:
             self.upstream_model = upstream
+        if ready.busy is not None:
+            self.queue_depth = await self._queued(client, ready.busy)
         return True
+
+    async def _queued(self, client: httpx.AsyncClient, path: str) -> int:
+        try:
+            body = (await client.get(f"{self.base_url}{path}")).json()
+        except (httpx.HTTPError, ValueError):
+            return 0
+        return sum(len(v) for v in body.values() if isinstance(v, list)) if isinstance(body, dict) else 0
 
     def pids(self) -> set[int]:
         # A daemonizing launcher exits and re-parents the server to init, so our own child pid says

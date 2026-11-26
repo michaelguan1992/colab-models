@@ -311,7 +311,7 @@ def test_idle_unload_waits_for_in_flight_requests_then_counts_their_end_as_activ
     asyncio.run(run())
 
 
-def test_idle_unload_waits_for_video_jobs():
+def test_idle_unload_waits_for_video_jobs_then_counts_their_end_as_activity():
     mgr = make_idle_manager()
 
     async def run():
@@ -323,6 +323,9 @@ def test_idle_unload_waits_for_video_jobs():
         await mgr.idle_check()
         assert "pika" in mgr.backends
         mgr.backends["pika"].queue_depth = 0
+        await mgr.idle_check()   # the job that just ended was activity: a full idle window starts now
+        assert "pika" in mgr.backends and mgr.status()["idle_seconds"] < 5
+        expire(mgr)
         await mgr.idle_check()
         assert mgr.backends == {}
     asyncio.run(run())

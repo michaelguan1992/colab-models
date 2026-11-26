@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+import webbrowser
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -38,7 +39,7 @@ STATE_ICON = {"ready": "● 在线", "offline": "○ 离线", "installing": "◐
 
 WATCHDOG_POLL_S = 60
 WATCHDOG_WAKE_GAP_S = 3 * WATCHDOG_POLL_S
-LOCKED_COMMANDS = {"up", "down", "load", "unload", "tunnel", "video", "image", "connect"}
+LOCKED_COMMANDS = {"up", "down", "load", "unload", "tunnel", "video", "image", "connect", "comfy"}
 
 
 # ---- helpers -------------------------------------------------------------
@@ -422,13 +423,48 @@ def _detail(r: httpx.Response) -> str:
 
 def cmd_video(cfg: Config, a) -> int:
     inp: dict = {"prompt": a.prompt, "seconds": a.seconds}
-    if a.image:
-        inp["image_b64"] = base64.b64encode(Path(a.image).expanduser().read_bytes()).decode()
+    for key, path in (("image_b64", a.image), ("last_image_b64", a.last_image)):
+        if path:
+            inp[key] = base64.b64encode(Path(path).expanduser().read_bytes()).decode()
     return _run_job(cfg, a, "video", inp)
 
 
 def cmd_image(cfg: Config, a) -> int:
-    return _run_job(cfg, a, "image", {"prompt": a.prompt})
+    inp: dict = {"prompt": a.prompt}
+    for k in ("negative_prompt", "cfg"):
+        if getattr(a, k) is not None:
+            inp[k] = getattr(a, k)
+    return _run_job(cfg, a, "image", inp)
+
+
+def cmd_comfy(cfg: Config, a) -> int:
+    ensure_tunnel(cfg)
+    model = a.model or cfg.comfy_model
+
+    def entry() -> dict | None:
+        models = api(cfg, "GET", "/admin/status").json()["models"]
+        return next((m for m in models if m["id"] == model and "comfyui" in m["serves"]), None)
+
+    m = entry()
+    if m is None:
+        print(f"{model} 不是 ComfyUI 模型；可用的见 lm status")
+        return 1
+    if m["state"] != "ready":
+        if m["state"] in ("offline", "stopped", "error") and not request_load(cfg, model, swap=True):
+            return 1
+        if not wait_model(cfg, model):
+            return 1
+        m = entry()
+    if not tunnel.forward(cfg, m["port"]):
+        print(f"无法转发本地端口 {m['port']}（可能被本机其他程序占用）；隧道断过的话先运行 lm tunnel")
+        return 1
+    home = (m.get("params") or {}).get("home")
+    url = f"http://127.0.0.1:{m['port']}/" + (f"?template={home}" if home else "")
+    presets = "其他预设在" if home else "预设在"
+    print(f"ComfyUI 已就绪：{url}\n{presets}左侧「工作流」面板（快捷键 W）。隧道重连后需要重新运行 lm comfy。")
+    if not a.no_open:
+        webbrowser.open(url)
+    return 0
 
 
 def _run_job(cfg: Config, a, serves: str, inp: dict) -> int:
@@ -573,6 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("video", help="用视频模型（Pika）生成视频并下载到本地")
     s.add_argument("prompt")
     s.add_argument("--image", help="首帧图片")
+    s.add_argument("--last-image", help="尾帧图片（可单独给，也可和首帧一起给）")
     s.add_argument("--seconds", type=float, default=5, help="5 到 15 秒")
     s.add_argument("--height", type=int, help="默认由模型决定")
     s.add_argument("--width", type=int, help="默认由模型决定")
@@ -585,10 +622,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("prompt")
     s.add_argument("--height", type=int, help="默认 1024，须为 16 的倍数")
     s.add_argument("--width", type=int, help="默认 1024，须为 16 的倍数")
+    s.add_argument("--negative", dest="negative_prompt", help="反向提示词；会打开 CFG，每步多一次前向，约慢一倍")
+    s.add_argument("--cfg", type=float, help="引导强度，1 到 10；默认 1，带反向提示词时默认 2")
     s.add_argument("--model", help="任务模型 id；默认用在线的图像模型")
     s.add_argument("--seed", type=int)
     s.add_argument("--out")
     s.set_defaults(fn=cmd_image)
+
+    s = sub.add_parser("comfy", help="加载 ComfyUI 模型并在浏览器里打开它（带预设工作流）")
+    s.add_argument("model", nargs="?", help="默认取配置 comfy_model")
+    s.add_argument("--no-open", action="store_true", help="只转发端口并打印地址，不开浏览器")
+    s.set_defaults(fn=cmd_comfy)
 
     s = sub.add_parser("tunnel", help="重建 ssh 隧道")
     s.set_defaults(fn=cmd_tunnel)

@@ -29,8 +29,9 @@ def _run(*argv: str) -> str:
 
 server = MCPServer(
     "lm", log_level="WARNING",
-    instructions=("Self-hosted models on a Colab GPU. Only one LLM is online at a time; a video or image model "
-                  "may need the LLM unloaded first. Check status before loading."))
+    instructions=("Self-hosted models on a Colab GPU. Only one LLM is online at a time. Check status before loading. "
+                  "Images and video are made in ComfyUI, which the user opens themselves with `lm comfy`; "
+                  "there is no generation tool here."))
 
 
 @server.tool()
@@ -64,29 +65,6 @@ def up(model: str | None = None) -> str:
 def down() -> str:
     """Unload every model and stop the Colab session, which stops billing."""
     return _run("down")
-
-
-@server.tool()
-def generate(prompt: str, seconds: float = 5, image_path: str | None = None, seed: int | None = None) -> str:
-    """Generate a video with synchronized audio (Pika) and save the MP4 locally. Needs the video model
-    online. seconds must be 5 to 15. Returns the saved path. Takes a minute or more."""
-    argv = ["video", prompt, "--seconds", str(seconds)]
-    if image_path:
-        argv += ["--image", image_path]
-    if seed is not None:
-        argv += ["--seed", str(seed)]
-    return _run(*argv)
-
-
-@server.tool()
-def generate_image(prompt: str, width: int | None = None, height: int | None = None, seed: int | None = None) -> str:
-    """Generate an image (MOSS-Image, 1024x1024 by default; sides are multiples of 16) and save the PNG locally.
-    Needs the image model online. Returns the saved path. Takes under a minute on the G4."""
-    argv = ["image", prompt]
-    for flag, v in (("--width", width), ("--height", height), ("--seed", seed)):
-        if v is not None:
-            argv += [flag, str(v)]
-    return _run(*argv)
 
 
 def run() -> int:
